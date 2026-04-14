@@ -1,0 +1,12 @@
+/*.rar
+/test_akshare.py
+/test_fixed.py
+/test_pdf_export.py
+/test_pe_pb.py
+/venv
+/__pycache__
+# 环境变量文件
+.env
+/.cursor
+/openspec
+TradEnv/
