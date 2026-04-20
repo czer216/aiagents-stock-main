@@ -72,7 +72,53 @@ class StockMonitorDatabase:
                 FOREIGN KEY (stock_id) REFERENCES monitored_stocks (id)
             )
         ''')
-        
+
+        # 快速拉升事件表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rapid_rise_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trade_date TEXT NOT NULL,
+                event_time TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT,
+                direction TEXT NOT NULL,
+                last_price REAL,
+                rise_1m REAL,
+                rise_3m REAL,
+                rise_5m REAL,
+                amount_1m REAL,
+                amount_ratio_1m20 REAL,
+                trigger_level TEXT,
+                rule_version TEXT,
+                theme_tokens TEXT,
+                theme_hist_score REAL,
+                peer_linkage_score REAL,
+                dedupe_key TEXT NOT NULL,
+                payload_json TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_rapid_rise_dedupe ON rapid_rise_events(dedupe_key)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_rapid_rise_symbol_time ON rapid_rise_events(symbol, event_time DESC)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_rapid_rise_trade_time ON rapid_rise_events(trade_date, event_time DESC)')
+
+        # 快速拉升推送记录表
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS rapid_rise_push_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id INTEGER NOT NULL,
+                channel TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reason TEXT,
+                provider_msg_id TEXT,
+                sent_at TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (event_id) REFERENCES rapid_rise_events(id)
+            )
+        ''')
+        cursor.execute('CREATE UNIQUE INDEX IF NOT EXISTS idx_rapid_push_event_channel ON rapid_rise_push_records(event_id, channel)')
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_rapid_push_status_time ON rapid_rise_push_records(status, created_at DESC)')
+
         conn.commit()
         conn.close()
     
@@ -305,21 +351,91 @@ class StockMonitorDatabase:
         
         return cursor.rowcount
     
+    def add_rapid_rise_event(self, event: Dict) -> Optional[int]:
+        """写入快速拉升事件，dedupe_key重复时返回None"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        try:
+            cursor.execute('''
+                INSERT INTO rapid_rise_events (
+                    trade_date, event_time, symbol, name, direction, last_price,
+                    rise_1m, rise_3m, rise_5m, amount_1m, amount_ratio_1m20,
+                    trigger_level, rule_version, theme_tokens,
+                    theme_hist_score, peer_linkage_score, dedupe_key, payload_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                event.get('trade_date'), event.get('event_time'), event.get('symbol'), event.get('name'),
+                event.get('direction', 'up'), event.get('last_price'), event.get('rise_1m'),
+                event.get('rise_3m'), event.get('rise_5m'), event.get('amount_1m'),
+                event.get('amount_ratio_1m20'), event.get('trigger_level'), event.get('rule_version', 'v1'),
+                event.get('theme_tokens', ''), event.get('theme_hist_score', 0.0),
+                event.get('peer_linkage_score', 0.0), event.get('dedupe_key'),
+                json.dumps(event.get('payload', {}), ensure_ascii=False)
+            ))
+            event_id = cursor.lastrowid
+            conn.commit()
+            return event_id
+        except sqlite3.IntegrityError:
+            return None
+        finally:
+            conn.close()
+
+    def has_recent_rapid_rise(self, symbol: str, direction: str = 'up', minutes: int = 8) -> bool:
+        """检查是否在最近N分钟内已存在同方向快速拉升事件"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT COUNT(*) FROM rapid_rise_events
+            WHERE symbol = ? AND direction = ?
+              AND datetime(event_time) > datetime('now', '-' || ? || ' minutes')
+        ''', (symbol, direction, minutes))
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count > 0
+
+    def get_recent_rapid_rise_events(self, limit: int = 50) -> List[Dict]:
+        """获取最近快速拉升事件"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            SELECT id, trade_date, event_time, symbol, name, direction, last_price,
+                   rise_1m, rise_3m, rise_5m, amount_ratio_1m20,
+                   trigger_level, theme_tokens, theme_hist_score, peer_linkage_score, created_at
+            FROM rapid_rise_events
+            ORDER BY event_time DESC
+            LIMIT ?
+        ''', (limit,))
+        rows = cursor.fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
+
+    def add_rapid_rise_push_record(self, event_id: int, channel: str, status: str, reason: str = ""):
+        """记录快速拉升事件推送结果"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT OR REPLACE INTO rapid_rise_push_records (event_id, channel, status, reason, sent_at)
+            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ''', (event_id, channel, status, reason))
+        conn.commit()
+        conn.close()
+
     def remove_monitored_stock(self, stock_id: int):
         """移除监测股票"""
         try:
             conn = sqlite3.connect(self.db_path)
             cursor = conn.cursor()
-            
+
             # 删除相关记录
             cursor.execute('DELETE FROM price_history WHERE stock_id = ?', (stock_id,))
             cursor.execute('DELETE FROM notifications WHERE stock_id = ?', (stock_id,))
             cursor.execute('DELETE FROM monitored_stocks WHERE id = ?', (stock_id,))
-            
+
             affected_rows = cursor.rowcount
             conn.commit()
             conn.close()
-            
+
             return affected_rows > 0
         except Exception as e:
             print(f"删除股票失败: {e}")

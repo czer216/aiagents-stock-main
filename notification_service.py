@@ -88,24 +88,30 @@ class NotificationService:
     def send_notification(self, notification: Dict) -> bool:
         """发送单个通知"""
         success = False
-        
+
+        # 兼容没有message字段的新通知类型
+        if 'message' not in notification or not notification.get('message'):
+            symbol = notification.get('symbol', '')
+            ntype = notification.get('type', 'notice')
+            notification['message'] = f"{symbol} {ntype}".strip() or "通知"
+
         # 尝试webhook通知
         if self.config['webhook_enabled']:
             webhook_success = self._send_webhook_notification(notification)
             if webhook_success:
                 success = True
-        
+
         # 尝试邮件通知
         if self.config['email_enabled']:
             email_success = self._send_email_notification(notification)
             if email_success:
                 success = True
-        
+
         # 如果两者都未启用或都失败，使用界面通知作为备用
         if not success:
             self._show_streamlit_notification(notification)
             success = True
-        
+
         return success
     
     def _send_email_notification(self, notification: Dict) -> bool:
@@ -126,7 +132,7 @@ class NotificationService:
             msg = MIMEMultipart()
             msg['From'] = self.config['email_from']
             msg['To'] = self.config['email_to']
-            msg['Subject'] = f"股票监测提醒 - {notification['symbol']}"
+            msg['Subject'] = notification.get('title') or f"股票监测提醒 - {notification['symbol']}"
             
             # 邮件正文
             body = f"""

@@ -15,6 +15,7 @@ import json
 
 from monitor_db import monitor_db
 from monitor_service import monitor_service
+from rapid_rise_monitor_service import rapid_rise_monitor_service
 from notification_service import notification_service
 from stock_data import StockDataFetcher
 from miniqmt_interface import miniqmt, get_miniqmt_status, QuantStrategyConfig
@@ -47,21 +48,21 @@ def display_monitor_status():
     """显示监测服务状态"""
     
     col1, col2, col3, col4, col5, col6 = st.columns(6)
-    
+
     with col1:
         if monitor_service.running:
             st.success("🟢 运行中")
         else:
             st.error("🔴 已停止")
-    
+
     with col2:
         stocks = monitor_db.get_monitored_stocks()
         st.metric("监测股票", len(stocks))
-    
+
     with col3:
         notifications = monitor_db.get_pending_notifications()
         st.metric("待处理通知", len(notifications))
-    
+
     with col4:
         # 显示MiniQMT状态
         qmt_status = get_miniqmt_status()
@@ -69,7 +70,7 @@ def display_monitor_status():
             st.success("🤖 QMT在线")
         else:
             st.info("🤖 QMT离线")
-    
+
     with col5:
         if monitor_service.running:
             if st.button("⏹️ 停止监测", type="secondary"):
@@ -81,11 +82,88 @@ def display_monitor_status():
                 monitor_service.start_monitoring()
                 st.success("✅ 监测服务已启动")
                 st.rerun()
-    
+
     with col6:
         if st.button("🔄 刷新状态"):
             st.rerun()
-    
+
+    st.markdown("### ⚡ 全市场快速拉升")
+    rr_cfg = rapid_rise_monitor_service.get_runtime_config()
+    rr_col1, rr_col2, rr_col3, rr_col4 = st.columns(4)
+
+    with rr_col1:
+        if rapid_rise_monitor_service.running:
+            st.success("🟢 快拉扫描中")
+        else:
+            st.info("⚪ 快拉已停止")
+
+    with rr_col2:
+        recent_events = monitor_db.get_recent_rapid_rise_events(limit=200)
+        st.metric("今日快拉事件", len(recent_events))
+
+    with rr_col3:
+        if rapid_rise_monitor_service.running:
+            if st.button("⏹️ 停止快拉", key="stop_rr"):
+                rapid_rise_monitor_service.stop()
+                st.success("✅ 快拉扫描已停止")
+                st.rerun()
+        else:
+            if st.button("▶️ 启动快拉", key="start_rr"):
+                rapid_rise_monitor_service.start()
+                st.success("✅ 快拉扫描已启动")
+                st.rerun()
+
+    with rr_col4:
+        st.caption("基于TDX batch-quote")
+        st.caption(f"当前代码池: {rr_cfg['symbols_count']} 只")
+
+    with st.expander("⚙️ 快拉参数配置", expanded=False):
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            interval_sec = st.number_input("扫描间隔(秒)", min_value=5, max_value=120, value=int(rr_cfg['interval_sec']), step=1)
+            threshold_1m = st.number_input("1分钟阈值(%)", min_value=0.2, max_value=10.0, value=float(rr_cfg['threshold_1m']), step=0.1)
+        with c2:
+            batch_size = st.number_input("批量大小", min_value=50, max_value=1200, value=int(rr_cfg['batch_size']), step=50)
+            threshold_3m = st.number_input("3分钟阈值(%)", min_value=0.5, max_value=15.0, value=float(rr_cfg['threshold_3m']), step=0.1)
+        with c3:
+            threshold_amt_ratio = st.number_input("量比阈值", min_value=0.5, max_value=10.0, value=float(rr_cfg['threshold_amt_ratio']), step=0.1)
+            max_push_per_minute = st.number_input("每分钟推送上限", min_value=1, max_value=300, value=int(rr_cfg['max_push_per_minute']), step=1)
+        with c4:
+            summary_interval_sec = st.number_input("摘要间隔(秒)", min_value=60, max_value=1800, value=int(rr_cfg['summary_interval_sec']), step=30)
+            summary_max_items = st.number_input("摘要题材条数", min_value=1, max_value=30, value=int(rr_cfg['summary_max_items']), step=1)
+
+        if st.button("✅ 应用快拉参数", key="apply_rr_cfg"):
+            rapid_rise_monitor_service.update_runtime_config(
+                interval_sec=interval_sec,
+                batch_size=batch_size,
+                threshold_1m=threshold_1m,
+                threshold_3m=threshold_3m,
+                threshold_amt_ratio=threshold_amt_ratio,
+                max_push_per_minute=max_push_per_minute,
+                summary_interval_sec=summary_interval_sec,
+                summary_max_items=summary_max_items,
+            )
+            st.success("✅ 快拉参数已应用（当前进程立即生效）")
+            st.rerun()
+
+        st.caption(
+            f"生效配置: interval={rr_cfg['interval_sec']}s, batch={rr_cfg['batch_size']}, "
+            f"阈值=({rr_cfg['threshold_1m']}%/{rr_cfg['threshold_3m']}%,量比{rr_cfg['threshold_amt_ratio']}), "
+            f"限频={rr_cfg['max_push_per_minute']}/min, 摘要={rr_cfg['summary_interval_sec']}s/{rr_cfg['summary_max_items']}条"
+        )
+
+    if recent_events:
+        show_count = min(20, len(recent_events))
+        st.caption(f"最近事件（{show_count}条）")
+        for item in recent_events[:show_count]:
+            st.info(
+                f"⚡ **{item['symbol']}** {item.get('trigger_level','L1')} | "
+                f"1m {float(item.get('rise_1m') or 0):.2f}% / "
+                f"3m {float(item.get('rise_3m') or 0):.2f}% / "
+                f"量比 {float(item.get('amount_ratio_1m20') or 0):.2f} | "
+                f"题材分 {float(item.get('theme_hist_score') or 0):.2f}"
+            )
+
     # 显示定时调度状态和配置
     display_scheduler_section()
 
