@@ -16,6 +16,16 @@ from longhubang_pdf import LonghubangPDFGenerator
 import config
 
 
+def _get_longhubang_engine(model=None) -> LonghubangEngine:
+    """会话级复用引擎实例，避免Streamlit重跑时反复初始化。"""
+    model_name = str(model or config.DEFAULT_MODEL_NAME or "default")
+    resolved_db_path = LonghubangEngine.resolve_db_path()
+    key = f"longhubang_engine_instance::{model_name}::{resolved_db_path}"
+    if key not in st.session_state:
+        st.session_state[key] = LonghubangEngine(model=model_name, db_path=resolved_db_path)
+    return st.session_state[key]
+
+
 def display_longhubang():
     """显示智瞰龙虎主界面"""
     
@@ -135,6 +145,8 @@ def display_analysis_tab():
                 value=3,
                 help="分析最近N天的龙虎榜数据"
             )
+    preview_date = selected_date.strftime('%Y-%m-%d') if analysis_mode == "指定日期" else None
+    preview_days = 3 if analysis_mode == "指定日期" else int(days)
 
     score_pool_label = st.selectbox(
         "评分池来源",
@@ -148,6 +160,149 @@ def display_analysis_tab():
         "龙虎榜+开盘啦": "lhb_kpl",
     }
     score_pool_source = score_pool_source_map.get(score_pool_label, "lhb_kpl")
+    enable_9d_trend_overlay = st.checkbox(
+        "启用9日趋势微调",
+        value=True,
+        help="默认开启：仅对候选股做小幅修正（单股±2分），不改变主评分框架",
+    )
+    trend_overlay_scale = st.slider(
+        "9日趋势微调系数",
+        min_value=0.0,
+        max_value=10.0,
+        value=1.0,
+        step=0.1,
+        help="1.0为默认强度；>1增强趋势影响，<1减弱趋势影响（0表示关闭加减分，最高可到10）",
+        disabled=not enable_9d_trend_overlay,
+    )
+    mainboard_limit_up_threshold_pct = st.slider(
+        "主板涨停判定阈值(%)",
+        min_value=1.0,
+        max_value=10.0,
+        value=6.0,
+        step=0.1,
+        help="用于‘当日涨停命中’判定。创业/科创=19.5%，北交所=29.5%，ST=4.8%",
+    )
+    colq1, colq2 = st.columns(2)
+    enable_recommendation_quota = st.checkbox(
+        "启用推荐分层配额",
+        value=True,
+        help="开启后按“涨停/非涨停”分层配额筛选；关闭后按原始候选顺序推荐",
+    )
+    with colq1:
+        recommendation_count = st.slider(
+            "推荐数量",
+            min_value=3,
+            max_value=12,
+            value=8,
+            step=1,
+            help="推荐阶段最终输出的股票数量",
+        )
+    with colq2:
+        recommendation_limit_up_ratio = st.slider(
+            "推荐中涨停占比上限",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.4,
+            step=0.05,
+            help="推荐阶段分层配额参数。基于“近涨停筛选标签”，0.4表示最多40%",
+            disabled=not enable_recommendation_quota,
+        )
+
+    st.markdown("#### 🧠 主线题材覆盖（可选）")
+    if "longhubang_concept_candidates" not in st.session_state:
+        st.session_state["longhubang_concept_candidates"] = []
+    colm1, colm2 = st.columns([1, 2])
+    with colm1:
+        load_candidates_btn = st.button(
+            "加载题材强度候选",
+            help="按程序同口径计算题材强度排序，供主观多选覆盖",
+        )
+    with colm2:
+        enable_manual_mainline_override = st.checkbox(
+            "启用主观主线题材覆盖",
+            value=False,
+            help="默认关闭：使用程序排序；开启后使用你选择的题材（最多3个）替代程序主线",
+        )
+    if load_candidates_btn:
+        with st.spinner("正在加载题材强度候选..."):
+            engine_for_preview = _get_longhubang_engine(model=config.DEFAULT_MODEL_NAME)
+            preview = engine_for_preview.get_concept_strength_candidates(
+                date=preview_date,
+                days=preview_days,
+                score_pool_source=score_pool_source,
+            )
+        if preview.get("data_success"):
+            st.session_state["longhubang_concept_candidates"] = preview.get("candidates", []) or []
+            st.success(f"已加载 {len(st.session_state['longhubang_concept_candidates'])} 个题材候选")
+        else:
+            st.warning(f"题材候选加载失败：{preview.get('error', '无可用数据')}")
+
+    concept_candidates = st.session_state.get("longhubang_concept_candidates", []) or []
+    if concept_candidates:
+        df_concepts = pd.DataFrame(concept_candidates)
+        st.dataframe(
+            df_concepts.head(15),
+            column_config={
+                "rank": st.column_config.NumberColumn("排序", format="%d", width="small"),
+                "concept": st.column_config.TextColumn("题材", width="medium"),
+                "strength_100": st.column_config.NumberColumn("强度分", format="%.2f"),
+                "count": st.column_config.NumberColumn("出现次数", format="%d"),
+                "pct_chg": st.column_config.NumberColumn("涨跌幅", format="%.2f"),
+                "source": st.column_config.TextColumn("来源", width="small"),
+            },
+            hide_index=True,
+            width='stretch',
+        )
+    manual_mainline_options = [str(x.get("concept", "")).strip() for x in concept_candidates if str(x.get("concept", "")).strip()]
+    manual_mainline_concepts = st.multiselect(
+        "主观最强题材（最多3个）",
+        options=manual_mainline_options,
+        default=[],
+        disabled=not enable_manual_mainline_override or not bool(manual_mainline_options),
+        help="建议先加载题材候选，再多选你主观认同的最强题材",
+    )
+    if len(manual_mainline_concepts) > 3:
+        st.warning("最多选择3个题材，已自动截取前3个。")
+        manual_mainline_concepts = manual_mainline_concepts[:3]
+
+    st.markdown("#### 🗂 历史数据维护（2026）")
+    backfill_col1, backfill_col2 = st.columns([1, 3])
+    with backfill_col1:
+        trigger_backfill_2026 = st.button(
+            "立即补齐2026历史数据",
+            help="手动触发：从2026-01-01补齐到目标交易日（增量循环补齐）",
+        )
+    with backfill_col2:
+        st.caption("用于首次建库或接口异常后的补数修复，不影响当次分析参数。")
+    if trigger_backfill_2026:
+        with st.spinner("正在补齐2026历史数据，请稍候..."):
+            engine_for_backfill = _get_longhubang_engine(model=config.DEFAULT_MODEL_NAME)
+            backfill_result = engine_for_backfill.backfill_2026_history(
+                end_date=preview_date if analysis_mode == "指定日期" else None,
+                batch_days=20,
+                max_rounds=40,
+            )
+        st.session_state["longhubang_history_backfill_result"] = backfill_result
+        if backfill_result.get("data_success"):
+            st.success(
+                f"补齐完成：更新交易日 {backfill_result.get('updated_days', 0)}，"
+                f"写入股票快照 {backfill_result.get('updated_stocks', 0)}，"
+                f"待补 {backfill_result.get('pending_days', 0)}，"
+                f"耗时 {backfill_result.get('elapsed_sec', 0)}s"
+            )
+        else:
+            nearest = str(backfill_result.get("nearest_open_day", "") or "").strip()
+            msg = f"补齐失败：{backfill_result.get('error', '未知错误')}"
+            if nearest:
+                msg += f"（最近交易日：{nearest}）"
+            st.error(msg)
+    last_backfill = st.session_state.get("longhubang_history_backfill_result", {}) or {}
+    if last_backfill:
+        st.caption(
+            f"最近一次补齐：latest={last_backfill.get('latest_trade_date', '-')} | "
+            f"updated_days={last_backfill.get('updated_days', 0)} | "
+            f"pending={last_backfill.get('pending_days', 0)}"
+        )
     
     # 分析按钮
     col1, col2 = st.columns([2, 2])
@@ -177,9 +332,28 @@ def display_analysis_tab():
                 date=date_str,
                 days=3,
                 score_pool_source=score_pool_source,
+                enable_9d_trend_overlay=enable_9d_trend_overlay,
+                trend_overlay_scale=trend_overlay_scale,
+                recommendation_count=recommendation_count,
+                recommendation_limit_up_ratio=recommendation_limit_up_ratio,
+                enable_recommendation_quota=enable_recommendation_quota,
+                mainboard_limit_up_threshold_pct=mainboard_limit_up_threshold_pct,
+                enable_manual_mainline_override=enable_manual_mainline_override,
+                manual_mainline_concepts=manual_mainline_concepts,
             )
         else:
-            run_longhubang_analysis(days=days, score_pool_source=score_pool_source)
+            run_longhubang_analysis(
+                days=days,
+                score_pool_source=score_pool_source,
+                enable_9d_trend_overlay=enable_9d_trend_overlay,
+                trend_overlay_scale=trend_overlay_scale,
+                recommendation_count=recommendation_count,
+                recommendation_limit_up_ratio=recommendation_limit_up_ratio,
+                enable_recommendation_quota=enable_recommendation_quota,
+                mainboard_limit_up_threshold_pct=mainboard_limit_up_threshold_pct,
+                enable_manual_mainline_override=enable_manual_mainline_override,
+                manual_mainline_concepts=manual_mainline_concepts,
+            )
     
     # 显示分析结果
     if 'longhubang_result' in st.session_state:
@@ -188,10 +362,27 @@ def display_analysis_tab():
         if result.get("success"):
             display_analysis_results(result)
         else:
-            st.error(f"❌ 分析失败: {result.get('error', '未知错误')}")
+            nearest = str(result.get("nearest_open_day", "") or "").strip()
+            msg = f"❌ 分析失败: {result.get('error', '未知错误')}"
+            if nearest:
+                msg += f"（最近交易日：{nearest}）"
+            st.error(msg)
 
 
-def run_longhubang_analysis(model=None, date=None, days=3, score_pool_source="lhb_kpl"):
+def run_longhubang_analysis(
+    model=None,
+    date=None,
+    days=3,
+    score_pool_source="lhb_kpl",
+    enable_9d_trend_overlay=True,
+    trend_overlay_scale=1.0,
+    recommendation_count=8,
+    recommendation_limit_up_ratio=0.4,
+    enable_recommendation_quota=True,
+    mainboard_limit_up_threshold_pct=6.0,
+    enable_manual_mainline_override=False,
+    manual_mainline_concepts=None,
+):
     """运行龙虎榜分析"""
     import config
     model = model or config.DEFAULT_MODEL_NAME
@@ -204,7 +395,7 @@ def run_longhubang_analysis(model=None, date=None, days=3, score_pool_source="lh
         status_text.text("🚀 初始化分析引擎...")
         progress_bar.progress(5)
         
-        engine = LonghubangEngine(model=model)
+        engine = _get_longhubang_engine(model=model)
         
         status_text.text("📊 正在获取龙虎榜数据...")
         progress_bar.progress(15)
@@ -214,6 +405,14 @@ def run_longhubang_analysis(model=None, date=None, days=3, score_pool_source="lh
             date=date,
             days=days,
             score_pool_source=score_pool_source,
+            enable_9d_trend_overlay=bool(enable_9d_trend_overlay),
+            trend_overlay_scale=float(trend_overlay_scale or 1.0),
+            recommendation_count=int(recommendation_count or 8),
+            recommendation_limit_up_ratio=float(recommendation_limit_up_ratio or 0.4),
+            enable_recommendation_quota=bool(enable_recommendation_quota),
+            mainboard_limit_up_threshold_pct=float(mainboard_limit_up_threshold_pct or 6.0),
+            enable_manual_mainline_override=bool(enable_manual_mainline_override),
+            manual_mainline_concepts=list(manual_mainline_concepts or []),
         )
         
         progress_bar.progress(90)
@@ -221,6 +420,8 @@ def run_longhubang_analysis(model=None, date=None, days=3, score_pool_source="lh
         if result.get("success"):
             # 保存结果
             st.session_state.longhubang_result = result
+            if result.get("concept_strength_candidates"):
+                st.session_state["longhubang_concept_candidates"] = result.get("concept_strength_candidates", [])
             
             progress_bar.progress(100)
             status_text.text("✅ 分析完成！")
@@ -232,7 +433,11 @@ def run_longhubang_analysis(model=None, date=None, days=3, score_pool_source="lh
             # 自动刷新显示结果
             st.rerun()
         else:
-            st.error(f"❌ 分析失败: {result.get('error', '未知错误')}")
+            nearest = str(result.get("nearest_open_day", "") or "").strip()
+            msg = f"❌ 分析失败: {result.get('error', '未知错误')}"
+            if nearest:
+                msg += f"（最近交易日：{nearest}）"
+            st.error(msg)
     
     except Exception as e:
         st.error(f"❌ 分析过程出错: {str(e)}")
@@ -248,6 +453,13 @@ def display_analysis_results(result):
     
     st.success("✅ 龙虎榜分析完成！")
     st.info(f"📅 分析时间: {result.get('timestamp', 'N/A')}")
+    history_sync = result.get("history_sync", {}) or {}
+    if history_sync:
+        st.caption(
+            f"历史统计同步(2026)：更新交易日 {history_sync.get('updated_days', 0)}，"
+            f"待补 {history_sync.get('pending_days', 0)}，"
+            f"最新 {history_sync.get('latest_trade_date', '-')}"
+        )
     
     # 数据概况
     data_info = result.get('data_info', {})
@@ -354,6 +566,8 @@ def display_scoring_ranking(result):
     
     scoring_df = result.get('scoring_ranking')
     concept_rotation = result.get('concept_rotation', {})
+    mainline_dual_track = result.get("mainline_dual_track", {}) or {}
+    mainline_info = result.get("mainline_selection_info", {}) or {}
     limit_step_heat = result.get('limit_step_heat', {})
     ths_hot_heat = result.get('ths_hot_heat', {})
     kpl_list_heat = result.get('kpl_list_heat', {})
@@ -391,6 +605,18 @@ def display_scoring_ranking(result):
             f"hot_num：{strongest.get('hot_num_total', 0)}） | "
             f"资金动向：**{rotation_summary.get('capital_flow_signal', 'N/A')}** | "
             f"数据源：**{concept_source_label}**"
+        )
+    full_market_track = (mainline_dual_track.get("full_market", {}) or {})
+    candidate_track = (mainline_dual_track.get("candidate_pool", {}) or {})
+    if isinstance(full_market_track, dict) and full_market_track.get("data_success"):
+        full_strong = (full_market_track.get("strongest_today", {}) or {}).get("concept", "N/A")
+        cand_strong = "N/A"
+        cand_cnt = 0
+        if isinstance(candidate_track, dict) and candidate_track.get("data_success"):
+            cand_strong = (candidate_track.get("strongest_today", {}) or {}).get("concept", "N/A")
+            cand_cnt = int((candidate_track.get("strongest_today", {}) or {}).get("stock_count", 0) or 0)
+        st.caption(
+            f"主线双轨：全市场最强={full_strong} | 候选池最强={cand_strong}（候选命中{cand_cnt}）"
         )
     
     # 连板晋级热度
@@ -433,6 +659,13 @@ def display_scoring_ranking(result):
             f"最热题材（过滤ST）：**{strongest_theme}** | "
             f"今日题材TOP（过滤ST）：**{top_theme_text}**"
         )
+    mode = str(mainline_info.get("mode", "auto") or "auto").strip().lower()
+    if mode == "manual":
+        manual_list = mainline_info.get("effective_concepts", []) or []
+        manual_text = "、".join([str(x) for x in manual_list if str(x).strip()]) or "暂无"
+        st.caption(f"当前主线来源：用户主观覆盖（手动） | 生效题材：{manual_text}")
+    else:
+        st.caption("当前主线来源：程序自动排序（默认）")
     
     # 评分说明
     with st.expander("📖 评分维度说明", expanded=False):
@@ -496,12 +729,24 @@ def display_scoring_ranking(result):
     if isinstance(scoring_df, list):
         scoring_df = pd.DataFrame(scoring_df)
 
-    numeric_cols = ['排名','综合评分','资金含金量','净买入额','卖出压力','机构共振','加分项','板块轮动','连板晋级','同花顺热榜','连板高度','顶级游资','买方数','净流入']
+    kline_9d = result.get("kline_9d_trend", {}) or {}
+    overlay_cfg = result.get("kline_9d_overlay_config", {}) or {}
+    overlay_scale = float(overlay_cfg.get("scale", 1.0) or 1.0)
+    if isinstance(kline_9d, dict) and kline_9d.get("data_success"):
+        trend_summary = kline_9d.get("trend_summary", {}) or {}
+        stage_dist = trend_summary.get("stage_distribution", {}) or {}
+        stage_text = "、".join([f"{k}:{v}" for k, v in list(stage_dist.items())[:4]]) or "暂无"
+        st.caption(
+            f"9日趋势微调已启用：样本 {trend_summary.get('tracked_stocks', 0)} 只 | "
+            f"阶段分布 {stage_text} | 系数 {overlay_scale:.1f} | 仅做修正（单股最高约±10分）"
+        )
+
+    numeric_cols = ['排名','综合评分','资金含金量','净买入额','卖出压力','机构共振','加分项','板块轮动','连板晋级','同花顺热榜','硬性扣分','连板高度','顶级游资','买方数','净流入','趋势微调','9日涨幅%','P1增强','机构净额','主力净流','封板质量','游资信号']
     for col in numeric_cols:
         if col in scoring_df.columns:
             scoring_df[col] = pd.to_numeric(scoring_df[col], errors='coerce')
 
-    text_cols = ['股票名称','股票代码','机构参与','主线匹配','热榜最佳']
+    text_cols = ['股票名称','股票代码','机构参与','主线匹配','热榜最佳','置信度']
     for col in text_cols:
         if col in scoring_df.columns:
             scoring_df[col] = scoring_df[col].astype(str)
@@ -570,13 +815,18 @@ def display_scoring_ranking(result):
                 min_value=0,
                 max_value=10
             ),
+            "硬性扣分": st.column_config.NumberColumn("硬性扣分", format="%.2f"),
             "顶级游资": st.column_config.NumberColumn("顶级游资", format="%d家"),
             "买方数": st.column_config.NumberColumn("买方数", format="%d家"),
             "机构参与": st.column_config.TextColumn("机构参与"),
+            "置信度": st.column_config.TextColumn("置信度"),
             "净流入": st.column_config.NumberColumn("净流入(元)", format="%.2f"),
             "主线匹配": st.column_config.TextColumn("主线匹配", width="medium"),
             "连板高度": st.column_config.NumberColumn("连板高度", format="%d板"),
             "热榜最佳": st.column_config.TextColumn("热榜最佳"),
+            "9日趋势": st.column_config.TextColumn("9日趋势"),
+            "趋势微调": st.column_config.NumberColumn("趋势微调", format="%.2f"),
+            "9日涨幅%": st.column_config.NumberColumn("9日涨幅%", format="%.2f"),
         },
         hide_index=True,
         width='stretch'
@@ -704,13 +954,18 @@ def display_scoring_ranking(result):
             "板块轮动": st.column_config.NumberColumn("板块轮动", format="%.1f"),
             "连板晋级": st.column_config.NumberColumn("连板晋级", format="%.1f"),
             "同花顺热榜": st.column_config.NumberColumn("同花顺热榜", format="%.1f"),
+            "硬性扣分": st.column_config.NumberColumn("硬性扣分", format="%.2f"),
             "顶级游资": st.column_config.NumberColumn("顶级游资", format="%d家"),
             "买方数": st.column_config.NumberColumn("买方数", format="%d家"),
             "机构参与": st.column_config.TextColumn("机构"),
+            "置信度": st.column_config.TextColumn("置信度"),
             "净流入": st.column_config.NumberColumn("净流入(元)", format="%.2f"),
             "主线匹配": st.column_config.TextColumn("主线匹配"),
             "连板高度": st.column_config.NumberColumn("连板高度", format="%d板"),
             "热榜最佳": st.column_config.TextColumn("热榜最佳"),
+            "9日趋势": st.column_config.TextColumn("9日趋势"),
+            "趋势微调": st.column_config.NumberColumn("趋势微调", format="%.2f"),
+            "9日涨幅%": st.column_config.NumberColumn("9日涨幅%", format="%.2f"),
         },
         hide_index=True,
         width='stretch'
@@ -727,11 +982,93 @@ def display_recommended_stocks(result):
     if not recommended:
         st.warning("暂无推荐股票")
         return
+    quota_cfg = result.get("recommendation_quota_config", {}) or {}
+    rec_count = int(quota_cfg.get("recommendation_count", len(recommended)) or len(recommended))
+    limit_ratio = float(quota_cfg.get("limit_up_ratio", 0.4) or 0.4)
+    quota_enabled = bool(quota_cfg.get("enabled", True))
+    threshold_cfg = result.get("limit_up_threshold_config", {}) or {}
+    mainboard_pct = float(threshold_cfg.get("mainboard_pct", 6.0) or 6.0)
+    st.caption(
+        f"推荐分层配额：{'开启' if quota_enabled else '关闭'} | 总数 {rec_count} | "
+        f"近涨停标签占比上限 {limit_ratio * 100:.0f}% | 主板阈值 {mainboard_pct:.1f}%"
+    )
+    candidate_pool = result.get("recommendation_candidate_pool", {}) or {}
+    if candidate_pool:
+        pool_total = int(candidate_pool.get("total", 0) or 0)
+        pool_source = str(candidate_pool.get("source", "") or "")
+        with st.expander("🧩 推荐候选池（调试）", expanded=False):
+            st.caption(f"来源：{pool_source or '-'} | 规模：{pool_total} 只")
+            pool_all = candidate_pool.get("all", []) or []
+            pool_sample = candidate_pool.get("sample", []) or []
+            if pool_all:
+                st.caption(f"当前展示：全量 {len(pool_all)} 只（样本 {len(pool_sample)} 只）")
+                df_pool = pd.DataFrame(pool_all)
+                st.dataframe(
+                    df_pool,
+                    column_config={
+                        "code": st.column_config.TextColumn("股票代码"),
+                        "name": st.column_config.TextColumn("股票名称"),
+                        "net_inflow": st.column_config.NumberColumn("净流入金额", format="%.2f"),
+                        "pct_chg": st.column_config.NumberColumn("涨跌幅%", format="%.2f"),
+                        "is_today_limit_up": st.column_config.CheckboxColumn("当日涨停"),
+                        "is_limit_like_for_quota": st.column_config.CheckboxColumn("近涨停标签"),
+                        "limit_quality_score": st.column_config.NumberColumn("封板质量", format="%.3f"),
+                        "p1_score": st.column_config.NumberColumn("P1分", format="%.3f"),
+                        "peer_rebound_score": st.column_config.NumberColumn("历史补涨分", format="%.2f"),
+                        "peer_hist_win_rate": st.column_config.NumberColumn("历史胜率", format="%.3f"),
+                        "peer_hist_avg_next_pct": st.column_config.NumberColumn("历史次日均涨%", format="%.3f"),
+                        "data_quality_grade": st.column_config.TextColumn("数据质量"),
+                        "theme_tokens": st.column_config.TextColumn("题材词"),
+                    },
+                    hide_index=True,
+                    width="stretch",
+                )
+            else:
+                st.info("候选池样本为空")
+
+    history_peer = result.get("history_peer_rebound", {}) or {}
+    if history_peer.get("data_success"):
+        with st.expander("🧪 历史统计驱动-同类低位补涨候选", expanded=False):
+            active = history_peer.get("active_themes", []) or []
+            st.caption(f"主线题材：{'、'.join(active[:8]) if active else '暂无'}")
+            breakdown = history_peer.get("pool_source_breakdown", {}) or {}
+            st.caption(
+                f"候选池构成：原池 {int(breakdown.get('base_count', 0) or 0)}，"
+                f"扩池 {int(breakdown.get('expanded_count', 0) or 0)}，"
+                f"剔除 {int(breakdown.get('dropped_count', 0) or 0)}（无当日daily "
+                f"{int(history_peer.get('dropped_no_daily_count', 0) or 0)}）"
+            )
+            df_peer = pd.DataFrame(history_peer.get("candidates", []) or [])
+            if not df_peer.empty:
+                st.dataframe(
+                    df_peer,
+                    column_config={
+                        "code": st.column_config.TextColumn("股票代码"),
+                        "name": st.column_config.TextColumn("股票名称"),
+                        "pct_chg": st.column_config.NumberColumn("涨跌幅%", format="%.2f"),
+                        "is_limit_like_for_quota": st.column_config.CheckboxColumn("近涨停标签"),
+                        "theme_tokens": st.column_config.TextColumn("命中题材"),
+                        "hist_win_rate": st.column_config.NumberColumn("历史胜率", format="%.3f"),
+                        "hist_avg_next_pct": st.column_config.NumberColumn("历史次日均涨%", format="%.3f"),
+                        "theme_strength_today": st.column_config.NumberColumn("当日题材强度", format="%.3f"),
+                        "low_position_score": st.column_config.NumberColumn("低位分", format="%.3f"),
+                        "peer_rebound_score": st.column_config.NumberColumn("补涨总分", format="%.2f"),
+                        "is_peer_pool_expanded": st.column_config.CheckboxColumn("扩池来源"),
+                    },
+                    hide_index=True,
+                    width="stretch",
+                )
+            else:
+                st.info("暂无历史补涨候选")
     
     st.info(f"💡 基于5位AI分析师的综合分析，系统识别出以下 **{len(recommended)}** 只潜力股票")
     
     # 创建DataFrame
     df_recommended = pd.DataFrame(recommended)
+    if "is_today_limit_up" in df_recommended.columns:
+        df_recommended["is_today_limit_up"] = df_recommended["is_today_limit_up"].apply(
+            lambda x: "是" if bool(x) else "否"
+        )
     
     # 显示表格
     st.dataframe(
@@ -741,6 +1078,7 @@ def display_recommended_stocks(result):
             "code": st.column_config.TextColumn("股票代码"),
             "name": st.column_config.TextColumn("股票名称"),
             "net_inflow": st.column_config.NumberColumn("净流入金额", format="%.2f"),
+            "is_today_limit_up": st.column_config.TextColumn("当日涨停"),
             "confidence": st.column_config.TextColumn("确定性"),
             "hold_period": st.column_config.TextColumn("持有周期"),
             "reason": st.column_config.TextColumn("推荐理由")
@@ -1095,7 +1433,7 @@ def display_history_tab():
     st.subheader("📚 历史分析报告")
     
     try:
-        engine = LonghubangEngine()
+        engine = _get_longhubang_engine()
         reports_df = engine.get_historical_reports(limit=50)
         
         if reports_df.empty:
@@ -1190,7 +1528,7 @@ def display_history_tab():
                         
                         df_scoring = pd.DataFrame(scoring_ranking[:10])
                         # 类型统一，避免Arrow序列化错误
-                        numeric_cols = ['排名','综合评分','资金含金量','净买入额','卖出压力','机构共振','加分项','板块轮动','连板晋级','同花顺热榜','连板高度','顶级游资','买方数','净流入']
+                        numeric_cols = ['排名','综合评分','资金含金量','净买入额','卖出压力','机构共振','加分项','板块轮动','连板晋级','同花顺热榜','连板高度','顶级游资','买方数','净流入','P1增强','机构净额','主力净流','封板质量','游资信号','硬性扣分','趋势微调','9日涨幅%']
                         for col in numeric_cols:
                             if col in df_scoring.columns:
                                 df_scoring[col] = pd.to_numeric(df_scoring[col], errors='coerce')
@@ -1407,7 +1745,7 @@ def display_history_tab():
                             if scoring_data:
                                 df_scoring = pd.DataFrame(scoring_data)
                                 # 类型统一，避免Arrow序列化错误
-                                numeric_cols = ['排名','综合评分','资金含金量','净买入额','卖出压力','机构共振','加分项','板块轮动','连板晋级','同花顺热榜','连板高度','顶级游资','买方数','净流入']
+                                numeric_cols = ['排名','综合评分','资金含金量','净买入额','卖出压力','机构共振','加分项','板块轮动','连板晋级','同花顺热榜','连板高度','顶级游资','买方数','净流入','P1增强','机构净额','主力净流','封板质量','游资信号','硬性扣分','趋势微调','9日涨幅%']
                                 for col in numeric_cols:
                                     if col in df_scoring.columns:
                                         df_scoring[col] = pd.to_numeric(df_scoring[col], errors='coerce')
@@ -1483,7 +1821,7 @@ def display_statistics_tab():
     st.subheader("📈 数据统计")
     
     try:
-        engine = LonghubangEngine()
+        engine = _get_longhubang_engine()
         stats = engine.get_statistics()
         
         # 基本统计

@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from data_source_manager import data_source_manager
 from tushare_proxy_rate_limit import call_tushare_with_timeout
+from trade_calendar_service import TradeCalendarService, TradeCalendarError
 
 warnings.filterwarnings('ignore')
 
@@ -27,7 +28,7 @@ class LonghubangDataFetcher:
         Args:
             api_key: StockAPI的API密钥（可选，普通请求每日免费1000次）
         """
-        print("[智瞰龙虎] 龙虎榜数据获取器初始化...")
+        print("[智瞰龙虎] 龙虎榜数据获取器初始化...", flush=True)
         # self.base_url = "https://api-lhb.zhongdu.net"
         self.base_url = "http://lhb-api.ws4.cn/v1"
        # self.base_url = "https://www.stockapi.com.cn/v1"
@@ -35,6 +36,7 @@ class LonghubangDataFetcher:
         self.max_retries = 3  # 最大重试次数
         self.retry_delay = 2  # 重试延迟（秒）
         self.request_delay = 0.025  # 请求间隔（秒），40次/秒 = 0.025秒/次
+        self.trade_calendar = TradeCalendarService()
     
     def _safe_request(self, url, params=None):
         """
@@ -59,17 +61,20 @@ class LonghubangDataFetcher:
                     if data.get('code') == 20000:
                         return data
                     else:
-                        print(f"    API返回错误: {data.get('msg', '未知错误')}")
+                        print(f"    API返回错误: {data.get('msg', '未知错误')}", flush=True)
                         return None
                 else:
-                    print(f"    HTTP错误: {response.status_code}")
+                    print(f"    HTTP错误: {response.status_code}", flush=True)
                     
             except Exception as e:
                 if attempt < self.max_retries - 1:
-                    print(f"    请求失败，{self.retry_delay}秒后重试... (尝试 {attempt + 1}/{self.max_retries})")
+                    print(
+                        f"    请求失败，{self.retry_delay}秒后重试... (尝试 {attempt + 1}/{self.max_retries})",
+                        flush=True,
+                    )
                     time.sleep(self.retry_delay)
                 else:
-                    print(f"    请求失败，已达最大重试次数: {e}")
+                    print(f"    请求失败，已达最大重试次数: {e}", flush=True)
                     return None
         
         return None
@@ -136,17 +141,9 @@ class LonghubangDataFetcher:
 
     def _build_recent_trade_dates(self, days: int = 3, end_date: Optional[str] = None) -> List[str]:
         target_days = max(int(days or 0), 1)
-        end_dt = self._parse_date_safe(end_date) if end_date else None
-        if end_dt is None:
-            end_dt = datetime.now()
-        out: List[str] = []
-        cur = end_dt
-        # 仅按工作日近似交易日，最多回看60个自然日防止异常死循环
-        while len(out) < target_days and len(out) < 60:
-            if cur.weekday() < 5:
-                out.append(cur.strftime("%Y-%m-%d"))
-            cur -= timedelta(days=1)
-        return out
+        end_compact = self._to_trade_date_compact(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        days8 = self.trade_calendar.recent_open_days(end_compact, target_days)
+        return [f"{x[:4]}-{x[4:6]}-{x[6:8]}" for x in days8]
 
     def _find_col(self, df: pd.DataFrame, keywords: List[str]) -> str:
         for col in df.columns:
@@ -166,6 +163,7 @@ class LonghubangDataFetcher:
         buy_col = self._find_col(df, ["l_buy", "buy", "买入"])
         sell_col = self._find_col(df, ["l_sell", "sell", "卖出"])
         net_col = self._find_col(df, ["net_amount", "net", "净额", "净买入"])
+        pct_col = self._find_col(df, ["pct_change", "pct_chg", "涨跌幅", "change", "pct"])
         reason_col = self._find_col(df, ["reason", "上榜原因"])
         date_col = self._find_col(df, ["trade_date", "date", "日期"])
 
@@ -188,6 +186,7 @@ class LonghubangDataFetcher:
             buy_raw = self._safe_float(row.get(buy_col)) if buy_col else 0.0
             sell_raw = self._safe_float(row.get(sell_col)) if sell_col else 0.0
             net_raw = self._safe_float(row.get(net_col)) if net_col else (buy_raw - sell_raw)
+            pct_chg = self._safe_float(row.get(pct_col)) if pct_col else 0.0
             buy_amt = buy_raw * amount_scale
             sell_amt = sell_raw * amount_scale
             net_amt = net_raw * amount_scale
@@ -209,6 +208,8 @@ class LonghubangDataFetcher:
                     "mcje": sell_amt,
                     "jlrje": net_amt,
                     "gl": "",
+                    "pct_chg": round(float(pct_chg or 0.0), 2),
+                    "pct_source": "tushare.top_list",
                     "data_source": "tushare.top_list",
                 }
             )
@@ -258,6 +259,93 @@ class LonghubangDataFetcher:
             }
         return None
 
+    def _normalize_stockapi_records(self, records: List[Dict[str, Any]], requested_date: str) -> List[Dict[str, Any]]:
+        """
+        统一StockAPI返回字段，重点兼容后续链路需要的 pct_chg。
+        - 若已存在 pct_chg 则保留；
+        - 否则尝试从 pct_change/涨跌幅/change/pct/zdf 等字段回填。
+        """
+        out: List[Dict[str, Any]] = []
+        for raw in (records or []):
+            if not isinstance(raw, dict):
+                continue
+            row = dict(raw)
+
+            # 代码/名称/日期最小兼容
+            code = self._normalize_stock_code(
+                row.get("gpdm")
+                or row.get("股票代码")
+                or row.get("ts_code")
+                or row.get("code")
+                or row.get("symbol")
+            )
+            if code:
+                row["gpdm"] = code
+
+            if not row.get("gpmc"):
+                row["gpmc"] = str(
+                    row.get("股票名称")
+                    or row.get("name")
+                    or row.get("简称")
+                    or ""
+                ).strip()
+
+            trade_date = self._normalize_trade_date(
+                row.get("rq") or row.get("日期") or row.get("trade_date") or row.get("date")
+            )
+            row["rq"] = trade_date or requested_date
+
+            # pct_chg 兼容映射（核心）
+            raw_pct = row.get("pct_chg", None)
+            if raw_pct is None or str(raw_pct).strip() == "":
+                for k in ["pct_change", "涨跌幅", "change", "pct", "zdf", "zd"]:
+                    if k in row and str(row.get(k)).strip() != "":
+                        raw_pct = row.get(k)
+                        break
+            row["pct_chg"] = round(float(self._safe_float(raw_pct)), 2)
+            if not row.get("pct_source"):
+                row["pct_source"] = "stockapi.youzi.all"
+
+            # 标注来源，便于排查
+            if not row.get("data_source"):
+                row["data_source"] = "stockapi.youzi.all"
+
+            out.append(row)
+        return out
+
+    def _merge_stockapi_gl_into_tushare(
+        self,
+        tushare_records: List[Dict[str, Any]],
+        stockapi_records: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        以 Tushare top_list 为主，按股票代码用 StockAPI 的 gl 回填概念字段。
+        """
+        if not tushare_records:
+            return []
+        gl_map: Dict[str, str] = {}
+        for row in (stockapi_records or []):
+            code = self._normalize_stock_code(row.get("gpdm") or row.get("股票代码") or row.get("code") or "")
+            if not code:
+                continue
+            gl = str(row.get("gl") or row.get("概念") or "").strip()
+            if gl and code not in gl_map:
+                gl_map[code] = gl
+
+        merged: List[Dict[str, Any]] = []
+        patched = 0
+        for raw in (tushare_records or []):
+            row = dict(raw or {})
+            code = self._normalize_stock_code(row.get("gpdm") or row.get("股票代码") or "")
+            old_gl = str(row.get("gl") or "").strip()
+            if code and not old_gl and gl_map.get(code):
+                row["gl"] = gl_map[code]
+                patched += 1
+            merged.append(row)
+        if patched > 0:
+            print(f"    ✓ 已用StockAPI回填概念gl {patched} 条", flush=True)
+        return merged
+
     def prioritize_latest_stock_records(self, data_list: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         同一股票跨交易日重复时，仅保留最近交易日的榜单记录；
@@ -303,25 +391,44 @@ class LonghubangDataFetcher:
         Returns:
             dict: 龙虎榜数据
         """
-        print(f"[智瞰龙虎] 获取 {date} 的龙虎榜数据...")
-        
-        # url = f"{self.base_url}"
-        url = f"{self.base_url}/youzi/all"
-        params = {'date': date}
-        
-        result = self._safe_request(url, params)
-        
-        if result and result.get('data'):
-            print(f"    ✓ 成功获取 {len(result['data'])} 条龙虎榜记录")
-            return result
+        print(f"[智瞰龙虎] 获取 {date} 的龙虎榜数据...", flush=True)
+        try:
+            date8 = self.trade_calendar.normalize_or_raise(date)
+            date = f"{date8[:4]}-{date8[4:6]}-{date8[6:8]}"
+        except TradeCalendarError:
+            return None
 
-        print(f"    ✗ StockAPI未获取到数据，尝试Tushare top_list兜底...")
-        fallback = self._get_tushare_top_list_data(date)
+        # 主数据源：Tushare top_list（日榜）
+        primary = self._get_tushare_top_list_data(date)
+        if primary and primary.get("data"):
+            # 使用 StockAPI 的 gl 回填概念（按股票代码匹配）
+            url = f"{self.base_url}/youzi/all"
+            params = {'date': date}
+            stockapi = self._safe_request(url, params)
+            stockapi_records: List[Dict[str, Any]] = []
+            if stockapi and stockapi.get("data"):
+                stockapi_records = self._normalize_stockapi_records(
+                    stockapi.get("data", []) or [],
+                    requested_date=date,
+                )
+            merged_records = self._merge_stockapi_gl_into_tushare(
+                primary.get("data", []) or [],
+                stockapi_records,
+            )
+            primary["data"] = merged_records
+            primary["source"] = "tushare.top_list+stockapi.gl"
+            print(f"    ✓ Tushare成功，获取 {len(primary['data'])} 条龙虎榜日榜记录", flush=True)
+            return primary
+
+        # 兜底：StockAPI（当 top_list 不可用时）
+        print(f"    ✗ Tushare未获取到数据，尝试StockAPI兜底...", flush=True)
+        fallback = self._safe_request(f"{self.base_url}/youzi/all", {'date': date})
         if fallback and fallback.get("data"):
-            print(f"    ✓ Tushare兜底成功，获取 {len(fallback['data'])} 条龙虎榜日榜记录")
+            fallback["data"] = self._normalize_stockapi_records(fallback.get("data", []) or [], requested_date=date)
+            print(f"    ✓ StockAPI兜底成功，获取 {len(fallback['data'])} 条龙虎榜记录", flush=True)
             return fallback
 
-        print(f"    ✗ 未获取到数据（StockAPI + Tushare兜底均失败）")
+        print(f"    ✗ 未获取到数据（Tushare + StockAPI兜底均失败）", flush=True)
         return None
     
     def get_longhubang_data_range(self, start_date, end_date):
@@ -335,27 +442,19 @@ class LonghubangDataFetcher:
         Returns:
             list: 龙虎榜数据列表
         """
-        print(f"[智瞰龙虎] 获取 {start_date} 至 {end_date} 的龙虎榜数据...")
+        print(f"[智瞰龙虎] 获取 {start_date} 至 {end_date} 的龙虎榜数据...", flush=True)
         
         all_data = []
+        start8 = self._to_trade_date_compact(start_date)
+        end8 = self._to_trade_date_compact(end_date)
+        open_days = self.trade_calendar.open_days_between(start8, end8)
+        for d8 in open_days:
+            date_str = f"{d8[:4]}-{d8[4:6]}-{d8[6:8]}"
+            result = self.get_longhubang_data(date_str)
+            if result and result.get('data'):
+                all_data.extend(result['data'])
         
-        # 转换日期
-        current_date = datetime.strptime(start_date, '%Y-%m-%d')
-        end_date_obj = datetime.strptime(end_date, '%Y-%m-%d')
-        
-        while current_date <= end_date_obj:
-            date_str = current_date.strftime('%Y-%m-%d')
-            
-            # 跳过周末
-            if current_date.weekday() < 5:  # 0-4表示周一到周五
-                result = self.get_longhubang_data(date_str)
-                if result and result.get('data'):
-                    all_data.extend(result['data'])
-            
-            # 下一天
-            current_date += timedelta(days=1)
-        
-        print(f"[智瞰龙虎] ✓ 共获取 {len(all_data)} 条记录")
+        print(f"[智瞰龙虎] ✓ 共获取 {len(all_data)} 条记录", flush=True)
         return all_data
     
     def get_recent_days_data(self, days=5, end_date: Optional[str] = None):
@@ -374,12 +473,12 @@ class LonghubangDataFetcher:
         if not trade_dates:
             return all_data
 
-        print(f"[智瞰龙虎] 获取近{len(trade_dates)}个交易日龙虎榜数据（截止 {trade_dates[0]}）...")
+        print(f"[智瞰龙虎] 获取近{len(trade_dates)}个交易日龙虎榜数据（截止 {trade_dates[0]}）...", flush=True)
         for date_str in trade_dates:
             result = self.get_longhubang_data(date_str)
             if result and result.get("data"):
                 all_data.extend(result["data"])
-        print(f"[智瞰龙虎] ✓ 近N日共获取 {len(all_data)} 条记录")
+        print(f"[智瞰龙虎] ✓ 近N日共获取 {len(all_data)} 条记录", flush=True)
         return all_data
     
     def parse_to_dataframe(self, data_list):
@@ -462,15 +561,102 @@ class LonghubangDataFetcher:
                 for (code, name), amount in top_stocks.head(20).items()
             ]
         
-        # 热门概念统计
-        if '概念' in df.columns:
-            all_concepts = []
-            for concepts in df['概念'].dropna():
-                all_concepts.extend(self._split_concepts(concepts))
-            
-            from collections import Counter
-            concept_counter = Counter(all_concepts)
+        # 热门概念统计（仅使用 theme/lu_desc 拆词来源）
+        from collections import Counter
+        concept_counter = Counter()
+        source_theme_counter = Counter()
+        forced_theme_counter = Counter()
+        for row in (data_list or []):
+            if not self._is_theme_source_record(row):
+                continue
+            raw_theme = row.get("gl") or row.get("概念") or ""
+            concepts = self._split_concepts(raw_theme)
+            for concept in concepts:
+                concept_counter[concept] += 1
+            # 仅统计 kpl_list / limit_list_ths 题材，作为 gl 选词参考主线
+            source = str(row.get("data_source", "") or "").strip().lower()
+            sblx = str(row.get("sblx", "") or row.get("榜单类型", "") or "").strip()
+            if ("kpl_list" in source) or ("limit_list_ths" in source) or ("开盘啦热榜" in sblx) or ("同花顺涨停池" in sblx):
+                for concept in concepts:
+                    source_theme_counter[concept] += 1
+            # 高连板题材强制保留（来自 kpl_list）
+            if "kpl_list" in source:
+                status = str(row.get("status", "") or "").strip()
+                streak = self._parse_streak(status)
+                if streak >= 3:
+                    for concept in concepts:
+                        forced_theme_counter[concept] += max(streak, 1)
+        if concept_counter:
             summary['hot_concepts'] = dict(concept_counter.most_common(20))
+        if source_theme_counter:
+            top_rows = list(source_theme_counter.most_common(100))
+            existed = {k for k, _ in top_rows}
+            if forced_theme_counter:
+                for concept, weight in forced_theme_counter.most_common(50):
+                    if concept in existed:
+                        continue
+                    top_rows.append((concept, int(source_theme_counter.get(concept, 0)) or int(weight)))
+                    existed.add(concept)
+            summary["theme_source_priority"] = [
+                {"theme": k, "count": int(v)}
+                for k, v in top_rows
+            ]
+
+        # Top股票的题材线索（优先用于AI推荐理由补充）
+        if summary.get("top_stocks") and '股票代码' in df.columns:
+            top_codes = [str(x.get("code", "") or "") for x in summary.get("top_stocks", [])[:20]]
+            clue_rows = []
+            for code in top_codes:
+                if not code:
+                    continue
+                source_rows = []
+                for row in (data_list or []):
+                    row_code = self._normalize_stock_code(row.get("gpdm") or row.get("股票代码") or "")
+                    if row_code != str(code):
+                        continue
+                    if not self._is_theme_source_record(row):
+                        continue
+                    source_rows.append(row)
+
+                if not source_rows:
+                    continue
+                name = str(source_rows[0].get("gpmc") or source_rows[0].get("股票名称") or "")
+                raw_seen = set()
+                raw_clues = []
+                concept_counter = Counter()
+                for row in source_rows:
+                    raw = row.get("gl") or row.get("概念") or ""
+                    text = str(raw or "").strip()
+                    if text and text not in raw_seen:
+                        raw_seen.add(text)
+                        raw_clues.append(text[:80])
+                    for cpt in self._split_concepts(text):
+                        if cpt:
+                            concept_counter[cpt] += 1
+                    if len(raw_clues) >= 3 and len(concept_counter) >= 5:
+                        continue
+
+                clue_rows.append(
+                    {
+                        "code": code,
+                        "name": name,
+                        "lu_desc_top": raw_clues,
+                        "theme_top": [c for c, _ in concept_counter.most_common(5)],
+                    }
+                )
+            summary["top_stock_lu_desc"] = clue_rows
+
+        # 全量个股GL兜底映射（用于“个股概念/题材缺失时”补充）
+        stock_gl_fallback: Dict[str, str] = {}
+        for row in (data_list or []):
+            code = self._normalize_stock_code(row.get("gpdm") or row.get("股票代码") or "")
+            if not code or code in stock_gl_fallback:
+                continue
+            raw_gl = str(row.get("gl") or row.get("概念") or "").strip()
+            if raw_gl:
+                stock_gl_fallback[code] = raw_gl[:120]
+        if stock_gl_fallback:
+            summary["stock_gl_fallback_map"] = stock_gl_fallback
         
         return summary
     
@@ -545,8 +731,13 @@ class LonghubangDataFetcher:
         text = str(raw or "").strip()
         if not text:
             return []
-        parts = re.split(r"[,，;；/|、\s]+", text)
-        noise = {"概念", "题材", "板块", "-", "--", "N/A", "None", "nan"}
+        parts = re.split(r"[+＋,，;；/|、\s]+", text)
+        noise = {
+            "概念", "题材", "板块", "-", "--", "N/A", "None", "nan",
+            "limit_list_ths补充", "kpl_list补充", "limit_list_ths", "kpl_list",
+            # 非题材属性噪声词
+            "融资融券", "沪股通", "深股通", "陆股通", "港股通",
+        }
         out = []
         for part in parts:
             concept = str(part or "").strip()
@@ -554,8 +745,41 @@ class LonghubangDataFetcher:
                 continue
             if concept in noise or len(concept) < 2 or concept.isdigit():
                 continue
+            if concept.endswith("板块"):
+                continue
+            lower_concept = concept.lower()
+            if ("limit_list_ths" in lower_concept) or ("kpl_list" in lower_concept):
+                continue
             out.append(concept)
         return out
+
+    def _parse_streak(self, status_text: str) -> int:
+        text = str(status_text or "").strip()
+        if not text:
+            return 0
+        m = re.search(r"(\d+)\s*天\s*(\d+)\s*板", text)
+        if m:
+            try:
+                return int(m.group(2))
+            except Exception:
+                return 0
+        m2 = re.search(r"(\d+)\s*连板", text)
+        if m2:
+            try:
+                return int(m2.group(1))
+            except Exception:
+                return 0
+        if "首板" in text:
+            return 1
+        return 0
+
+    def _is_theme_source_record(self, row: Dict[str, Any]) -> bool:
+        source = str(row.get("data_source", "") or "").strip().lower()
+        if "kpl_list" in source or "limit_list_ths" in source:
+            return True
+        # 明确：top_list/stockapi 的 gl 不进入题材池
+        sblx = str(row.get("sblx", "") or row.get("榜单类型", "") or "").strip()
+        return ("开盘啦热榜" in sblx) or ("同花顺涨停池" in sblx)
 
 
 # 测试函数

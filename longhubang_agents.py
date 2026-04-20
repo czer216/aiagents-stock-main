@@ -7,6 +7,7 @@ from deepseek_client import DeepSeekClient
 from typing import Dict, Any, List, Optional
 import time
 import logging
+import re
 import config
 
 
@@ -47,6 +48,99 @@ class LonghubangAgents:
     def _ok(self, data: Optional[Dict[str, Any]]) -> bool:
         return isinstance(data, dict) and data.get("data_success")
 
+    def _split_theme_tokens(self, text: str) -> List[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return []
+        parts = re.split(r"[+＋,，;；/|、\s]+", raw)
+        noise = {
+            "涨停", "跌停", "概念", "题材", "板块", "原因", "N/A", "None", "nan", "-",
+            "融资融券", "沪股通", "深股通", "陆股通", "港股通",
+        }
+        out: List[str] = []
+        seen = set()
+        for part in parts:
+            token = str(part or "").strip()
+            if not token or token in noise or token.isdigit() or len(token) < 2:
+                continue
+            if token.endswith("板块"):
+                continue
+            if token not in seen:
+                seen.add(token)
+                out.append(token)
+        return out
+
+    def _build_theme_whitelist_context(self, summary: Dict[str, Any]) -> str:
+        """
+        构建题材白名单：
+        - 主体使用统一字段 theme_top
+        - 同时补充 lu_desc_top 拆词（仅当后端已判定为真实来源时才会存在）
+        """
+        tokens: List[str] = []
+        seen = set()
+        for row in (summary.get("top_stock_lu_desc", []) or []):
+            for item in (row.get("theme_top", []) or []):
+                text = str(item or "").strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    tokens.append(text)
+            for raw in (row.get("lu_desc_top", []) or []):
+                for text in self._split_theme_tokens(raw):
+                    if text and text not in seen:
+                        seen.add(text)
+                        tokens.append(text)
+        if not tokens:
+            return (
+                "\n【题材词白名单】\n"
+                "- 当前无可用白名单词；允许使用AI知识补充题材，但必须显式标注“AI知识标签：xxx”。"
+            )
+        top_tokens = tokens[:80]
+        return (
+            "\n【题材词白名单（仅可使用以下词）】\n"
+            + "、".join(top_tokens)
+            + "\n【硬性约束】\n"
+            + "- 所有题材/概念表述必须来自上述白名单，不允许同义词扩展、行业推断或自造词。\n"
+            + "- 若某股票匹配不到白名单词，可使用AI知识补充，但必须显式写“AI知识标签：xxx”。"
+        )
+
+    def _build_stock_theme_binding_context(self, summary: Dict[str, Any]) -> str:
+        """
+        个股题材绑定约束：
+        - 每只股票仅可使用该股票自身的 theme_top + lu_desc_top 拆词结果
+        - 禁止跨股票借用题材词
+        """
+        rows = []
+        for item in (summary.get("top_stock_lu_desc", []) or [])[:30]:
+            code = self._normalize_code(item.get("code", ""))
+            name = str(item.get("name", "") or "").strip()
+            if not code:
+                continue
+            own_tokens: List[str] = []
+            seen = set()
+            for tok in (item.get("theme_top", []) or []):
+                text = str(tok or "").strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    own_tokens.append(text)
+            for raw in (item.get("lu_desc_top", []) or []):
+                for text in self._split_theme_tokens(raw):
+                    if text and text not in seen:
+                        seen.add(text)
+                        own_tokens.append(text)
+            rows.append(
+                f"- {name}({code}): {'、'.join(own_tokens[:6]) if own_tokens else '题材线索不足'}"
+            )
+        if not rows:
+            rows = ["- 暂无个股题材绑定数据，允许使用AI知识标签（需显式标注“AI知识标签：xxx”）。"]
+        return (
+            "\n【个股题材绑定清单（逐股强约束）】\n"
+            + "\n".join(rows)
+            + "\n【逐股硬性规则】\n"
+            + "- 当你分析/推荐某只股票时，只能使用该股票在上表同一行中的题材词。\n"
+            + "- 严禁使用其他股票行的题材词，严禁跨股票迁移概念。\n"
+            + "- 若该股票行是“题材线索不足”，允许使用AI知识补充，但必须写“AI知识标签：xxx”。"
+        )
+
     def _build_brief_signal_context(
         self,
         concept_rotation_data: Optional[Dict[str, Any]] = None,
@@ -54,6 +148,9 @@ class LonghubangAgents:
         ths_hot_data: Optional[Dict[str, Any]] = None,
         kpl_list_data: Optional[Dict[str, Any]] = None,
         p1_signal_data: Optional[Dict[str, Any]] = None,
+        kline_9d_data: Optional[Dict[str, Any]] = None,
+        trend_overlay_scale: float = 1.0,
+        fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         lines = ["【龙虎榜补充热度信号（Tushare摘要）】"]
 
@@ -145,8 +242,78 @@ class LonghubangAgents:
                 f"游资画像TOP {youzi_top_text}"
             )
 
+        if isinstance(kline_9d_data, dict) and kline_9d_data.get("data_success"):
+            trend_summary = kline_9d_data.get("trend_summary", {}) or {}
+            stage_dist = trend_summary.get("stage_distribution", {}) or {}
+            stage_text = "、".join([f"{k}:{v}" for k, v in stage_dist.items() if v]) or "暂无"
+            top_strength = (kline_9d_data.get("top_strength", []) or [])[:5]
+            top_text = "、".join(
+                [
+                    f"{x.get('name', x.get('code', ''))}({x.get('code', '')})/"
+                    f"{x.get('trend_stage', '-')}/"
+                    f"{x.get('change_7d_pct', 0)}%"
+                    for x in top_strength
+                    if x.get("code")
+                ]
+            ) or "暂无"
+            lines.append(
+                f"- 9日K线趋势：覆盖 {trend_summary.get('tracked_stocks', 0)} 只，"
+                f"分布 {stage_text}，"
+                f"强势TOP {top_text}"
+            )
+            scale = max(0.0, min(float(trend_overlay_scale or 1.0), 10.0))
+            if scale <= 0.0:
+                weight_tip = "已关闭（仅忽略）"
+            elif scale <= 1.0:
+                weight_tip = "弱参考（仅辅助）"
+            elif scale <= 3.0:
+                weight_tip = "中等参考（辅助判断）"
+            else:
+                weight_tip = "较强参考（仍不主导）"
+            lines.append(
+                f"- 9日K线参考权重：{round(scale, 2)}/10，{weight_tip}。"
+                f"请勿仅依据K线否定资金与题材主信号。"
+            )
+
         if len(lines) == 1:
             lines.append("- 暂无可用的补充热度信号（可能为Token权限或接口数据为空）")
+
+        if fixed_candidate_stocks:
+            lines.append("\n【固定候选池（统一上下文）】")
+            lines.append("- 以下候选池为系统固定列表，所有分析师请在该范围内优先分析与推荐。")
+            lines.append("- 格式：序号. 股票名称(代码) | 净流入 | pct_chg | 当日涨停 | 近涨停标签 | 封板质量 | 数据质量(A/B/C) | 题材词")
+            for idx, stock in enumerate((fixed_candidate_stocks or [])[:40], 1):
+                code = self._normalize_code(stock.get("code", ""))
+                if not code:
+                    continue
+                name = str(stock.get("name", "") or "")
+                try:
+                    net_inflow = float(stock.get("net_inflow", 0.0) or 0.0)
+                except Exception:
+                    net_inflow = 0.0
+                pct_raw = stock.get("pct_chg", None)
+                try:
+                    pct_text = "-" if pct_raw is None else f"{round(float(pct_raw), 2)}%"
+                except Exception:
+                    pct_text = "-"
+                is_limit_up = "是" if bool(stock.get("is_today_limit_up", False)) else "否"
+                is_limit_like = "是" if bool(stock.get("is_limit_like_for_quota", False)) else "否"
+                try:
+                    limit_quality = round(float(stock.get("limit_quality_score", 0.0) or 0.0), 3)
+                except Exception:
+                    limit_quality = 0.0
+                quality_grade = str(stock.get("data_quality_grade", "") or "-")
+                raw_themes = stock.get("theme_tokens", [])
+                if isinstance(raw_themes, str):
+                    themes = raw_themes.strip() or "暂无"
+                else:
+                    themes = "、".join([str(x) for x in (raw_themes or [])[:3] if str(x).strip()]) or "暂无"
+                lines.append(
+                    f"{idx}. {name}({code}) | 净流入 {net_inflow:,.2f} | "
+                    f"pct_chg {pct_text} | 当日涨停 {is_limit_up} | 近涨停标签 {is_limit_like} | "
+                    f"封板质量 {limit_quality} | 数据质量 {quality_grade} | 题材词 {themes}"
+                )
+            lines.append(f"- 固定候选池总数：{len(fixed_candidate_stocks)}")
 
         return "\n".join(lines)
 
@@ -157,10 +324,13 @@ class LonghubangAgents:
         ths_hot_data: Optional[Dict[str, Any]] = None,
         kpl_list_data: Optional[Dict[str, Any]] = None,
         p1_signal_data: Optional[Dict[str, Any]] = None,
+        kline_9d_data: Optional[Dict[str, Any]] = None,
+        trend_overlay_scale: float = 1.0,
+        fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         lines = [
             self._build_brief_signal_context(
-                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data
+                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
             )
         ]
 
@@ -235,10 +405,13 @@ class LonghubangAgents:
         ths_hot_data: Optional[Dict[str, Any]] = None,
         kpl_list_data: Optional[Dict[str, Any]] = None,
         p1_signal_data: Optional[Dict[str, Any]] = None,
+        kline_9d_data: Optional[Dict[str, Any]] = None,
+        trend_overlay_scale: float = 1.0,
+        fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         lines = [
             self._build_brief_signal_context(
-                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data
+                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
             )
         ]
         lines.append("\n【个股级热度信号（用于筛选次日关注股）】")
@@ -345,10 +518,13 @@ class LonghubangAgents:
         ths_hot_data: Optional[Dict[str, Any]] = None,
         kpl_list_data: Optional[Dict[str, Any]] = None,
         p1_signal_data: Optional[Dict[str, Any]] = None,
+        kline_9d_data: Optional[Dict[str, Any]] = None,
+        trend_overlay_scale: float = 1.0,
+        fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
     ) -> str:
         lines = [
             self._build_brief_signal_context(
-                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data
+                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
             )
         ]
         risk_flags: List[str] = []
@@ -401,6 +577,14 @@ class LonghubangAgents:
             if youzi_out >= 8:
                 risk_flags.append("游资净卖出股票偏多（短线兑现压力上升）")
 
+        if isinstance(kline_9d_data, dict) and kline_9d_data.get("data_success"):
+            trend_summary = kline_9d_data.get("trend_summary", {}) or {}
+            high_shake = int(trend_summary.get("high_shake_count", 0) or 0)
+            decline = int(trend_summary.get("decline_count", 0) or 0)
+            tracked = int(trend_summary.get("tracked_stocks", 0) or 0)
+            if tracked > 0 and (high_shake + decline) >= max(5, int(tracked * 0.35)):
+                risk_flags.append("9日K线显示高位震荡/退潮占比偏高（次日分歧风险）")
+
         lines.append("\n【风险优先信号】")
         if risk_flags:
             for idx, flag in enumerate(risk_flags, 1):
@@ -418,10 +602,12 @@ class LonghubangAgents:
         ths_hot_data: Optional[Dict[str, Any]] = None,
         kpl_list_data: Optional[Dict[str, Any]] = None,
         p1_signal_data: Optional[Dict[str, Any]] = None,
+        kline_9d_data: Optional[Dict[str, Any]] = None,
+        trend_overlay_scale: float = 1.0,
     ) -> str:
         lines = [
             self._build_brief_signal_context(
-                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data
+                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale
             )
         ]
 
@@ -445,6 +631,11 @@ class LonghubangAgents:
             if self._ok(p1_signal_data)
             else {}
         )
+        lu_desc_map = {}
+        for item in (summary.get("top_stock_lu_desc", []) or []):
+            code = self._normalize_code(item.get("code", ""))
+            if code:
+                lu_desc_map[code] = item
         signal_top = []
         for item in (summary.get("top_stocks", []) or [])[:20]:
             code = self._normalize_code(item.get("code", ""))
@@ -466,6 +657,8 @@ class LonghubangAgents:
                     "hot_score": round(hot_score, 2),
                     "kpl_score": round(kpl_score, 2),
                     "p1_score": round(p1_score, 2),
+                    "lu_desc_top": (lu_desc_map.get(code, {}) or {}).get("lu_desc_top", [])[:2],
+                    "theme_top": (lu_desc_map.get(code, {}) or {}).get("theme_top", [])[:3],
                 }
             )
         signal_top.sort(key=lambda x: x["signal_total"], reverse=True)
@@ -474,7 +667,9 @@ class LonghubangAgents:
             for idx, item in enumerate(signal_top[:8], 1):
                 lines.append(
                     f"{idx}. {item['name']}({item['code']}): 信号总分{item['signal_total']} "
-                    f"(连板{item['step_score']} + 热榜{item['hot_score']} + KPL{item['kpl_score']} + P1{item['p1_score']})"
+                    f"(连板{item['step_score']} + 热榜{item['hot_score']} + KPL{item['kpl_score']} + P1{item['p1_score']}) | "
+                    f"题材线索 {'；'.join(item['lu_desc_top']) or '暂无'} | "
+                    f"题材词 {'、'.join(item['theme_top']) or '暂无'}"
                 )
         else:
             lines.append("- 暂无可用的高热度候选映射数据")
@@ -490,6 +685,9 @@ class LonghubangAgents:
         ths_hot_data: Optional[Dict[str, Any]] = None,
         kpl_list_data: Optional[Dict[str, Any]] = None,
         p1_signal_data: Optional[Dict[str, Any]] = None,
+        kline_9d_data: Optional[Dict[str, Any]] = None,
+        trend_overlay_scale: float = 1.0,
+        fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         游资行为分析师 - 分析游资操作特征和意图
@@ -509,7 +707,7 @@ class LonghubangAgents:
             for idx, (name, amount) in enumerate(list(summary['top_youzi'].items())[:15], 1):
                 youzi_info += f"{idx}. {name}: 净流入 {amount:,.2f} 元\n"
         youzi_signal_context = self._build_brief_signal_context(
-            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data
+            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
         )
         
         prompt = f"""
@@ -601,6 +799,9 @@ class LonghubangAgents:
         ths_hot_data: Optional[Dict[str, Any]] = None,
         kpl_list_data: Optional[Dict[str, Any]] = None,
         p1_signal_data: Optional[Dict[str, Any]] = None,
+        kline_9d_data: Optional[Dict[str, Any]] = None,
+        trend_overlay_scale: float = 1.0,
+        fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         个股潜力分析师 - 从龙虎榜数据挖掘潜力股
@@ -620,8 +821,10 @@ class LonghubangAgents:
             for idx, stock in enumerate(summary['top_stocks'][:20], 1):
                 stock_info += f"{idx}. {stock['name']}({stock['code']}): 净流入 {stock['net_inflow']:,.2f} 元\n"
         stock_signal_context = self._build_stock_signal_context(
-            summary, concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data
+            summary, concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
         )
+        theme_whitelist_context = self._build_theme_whitelist_context(summary or {})
+        stock_theme_binding_context = self._build_stock_theme_binding_context(summary or {})
         
         prompt = f"""
 你是一名资深的个股研究专家和短线交易高手，精通技术分析和资金分析，擅长从龙虎榜中挖掘短期爆发股。
@@ -633,6 +836,8 @@ class LonghubangAgents:
 
 {stock_info}
 {stock_signal_context}
+{theme_whitelist_context}
+{stock_theme_binding_context}
 
 {longhubang_data[:8000]}
 
@@ -640,6 +845,7 @@ class LonghubangAgents:
 
 1. **次日大概率上涨股票挖掘** ⭐⭐⭐ 最核心
    - 识别5-8只次日大概率上涨的股票
+   - 严禁推荐“当日跌停池”股票
    - 详细分析每只股票的上涨逻辑（资金面、技术面、题材面）
    - 评估每只股票的上涨空间和确定性（高/中/低）
    - 给出买入时机与风控思路（不写具体价格）
@@ -661,6 +867,7 @@ class LonghubangAgents:
    - 分析题材的持续性和爆发力
    - 找出题材龙头和低位补涨股
    - 预判题材的炒作周期
+   - 优先使用“题材词白名单”；若个股无词池，可补“AI知识标签：xxx”
 
 5. **游资持仓分析**
    - 识别游资重仓持有的股票
@@ -715,6 +922,9 @@ class LonghubangAgents:
         ths_hot_data: Optional[Dict[str, Any]] = None,
         kpl_list_data: Optional[Dict[str, Any]] = None,
         p1_signal_data: Optional[Dict[str, Any]] = None,
+        kline_9d_data: Optional[Dict[str, Any]] = None,
+        trend_overlay_scale: float = 1.0,
+        fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         题材追踪分析师 - 分析龙虎榜中的热点题材
@@ -734,8 +944,10 @@ class LonghubangAgents:
             for idx, (concept, count) in enumerate(list(summary['hot_concepts'].items())[:20], 1):
                 concept_info += f"{idx}. {concept}: 出现 {count} 次\n"
         theme_signal_context = self._build_theme_signal_context(
-            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data
+            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
         )
+        theme_whitelist_context = self._build_theme_whitelist_context(summary or {})
+        stock_theme_binding_context = self._build_stock_theme_binding_context(summary or {})
         
         prompt = f"""
 你是一名资深的题材研究专家，拥有敏锐的市场嗅觉，擅长从龙虎榜数据中捕捉题材热点和板块轮动机会。
@@ -746,13 +958,15 @@ class LonghubangAgents:
 
 {concept_info}
 {theme_signal_context}
+{theme_whitelist_context}
+{stock_theme_binding_context}
 
 {longhubang_data[:8000]}
 
 请基于以上龙虎榜数据，进行深入的题材追踪分析：
 
 1. **热点题材识别** ⭐ 核心
-   - 识别当前最热门的5-8个题材/概念
+   - 识别当前最热门的5-8个题材/概念（优先白名单；无词池个股可补AI知识标签）
    - 分析每个题材的核心逻辑和催化剂
    - 评估题材的市场关注度和参与度
    - 判断题材是主流还是伪题材
@@ -828,6 +1042,9 @@ class LonghubangAgents:
         ths_hot_data: Optional[Dict[str, Any]] = None,
         kpl_list_data: Optional[Dict[str, Any]] = None,
         p1_signal_data: Optional[Dict[str, Any]] = None,
+        kline_9d_data: Optional[Dict[str, Any]] = None,
+        trend_overlay_scale: float = 1.0,
+        fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         风险控制专家 - 识别龙虎榜中的风险信号
@@ -840,7 +1057,7 @@ class LonghubangAgents:
         self.logger.info("⚠️ 风险控制专家正在分析...")
         time.sleep(1)
         risk_signal_context = self._build_risk_signal_context(
-            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data
+            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
         )
         
         prompt = f"""
@@ -937,6 +1154,12 @@ class LonghubangAgents:
         ths_hot_data: Optional[Dict[str, Any]] = None,
         kpl_list_data: Optional[Dict[str, Any]] = None,
         p1_signal_data: Optional[Dict[str, Any]] = None,
+        kline_9d_data: Optional[Dict[str, Any]] = None,
+        trend_overlay_scale: float = 1.0,
+        recommendation_count: int = 8,
+        recommendation_limit_up_ratio: float = 0.4,
+        enable_recommendation_quota: bool = True,
+        candidate_quota_context: str = "",
     ) -> Dict[str, Any]:
         """
         首席策略师 - 综合所有分析师的意见，给出最终投资建议
@@ -958,8 +1181,14 @@ class LonghubangAgents:
             analyses_text += f"{'='*60}\n"
             analyses_text += analysis['analysis'] + "\n"
         chief_signal_context = self._build_chief_signal_context(
-            summary or {}, concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data
+            summary or {}, concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale
         )
+        theme_whitelist_context = self._build_theme_whitelist_context(summary or {})
+        stock_theme_binding_context = self._build_stock_theme_binding_context(summary or {})
+        quota_enabled = bool(enable_recommendation_quota)
+        quota_count = max(3, min(int(recommendation_count or 8), 12))
+        quota_ratio = max(0.0, min(float(recommendation_limit_up_ratio or 0.4), 1.0))
+        max_limit_like = int(quota_count * quota_ratio + 1e-9)
         
         prompt = f"""
 你是一名资深的首席投资策略师，拥有CFA、FRM等专业资格，具有25年的市场实战经验和卓越的综合分析能力。
@@ -973,6 +1202,15 @@ class LonghubangAgents:
 以下是各位分析师的详细分析报告：
 
 {chief_signal_context}
+{theme_whitelist_context}
+{stock_theme_binding_context}
+{candidate_quota_context}
+
+【推荐分层配额约束（最终表格必须满足）】
+- 启用状态：{"开启" if quota_enabled else "关闭"}
+- 推荐总数：{quota_count}
+- 近涨停标签占比上限：{round(quota_ratio * 100, 2)}%（最多 {max_limit_like} 只）
+- 说明：当配额开启时，“次日重点推荐股票表”必须严格遵守该比例与总数。
 
 {analyses_text[:15000]}
 
@@ -986,9 +1224,10 @@ class LonghubangAgents:
 
 2. **次日重点推荐股票（TOP5-8）** ⭐⭐⭐ 最核心
    - 综合4位分析师的意见，筛选出5-8只次日最有潜力的股票
+   - 严禁纳入“当日跌停池”股票
    - 每只股票必须包含：
      * 股票名称和代码
-     * 推荐理由（多维度综合）
+     * 推荐理由（多维度综合，优先引用“lu_desc线索/题材词”作为逻辑依据）
      * 确定性评级（高/中/低）
      * 买入时机建议（分歧低吸/回踩确认/放量突破等）
      * 交易触发条件（仅文字描述，不写价格）
@@ -1016,7 +1255,20 @@ class LonghubangAgents:
    - 强调纪律执行
    - 给出应对预案
 
-请给出专业、全面、可执行的首席策略师综合报告。报告要有明确的结论和可操作性！
+【输出格式强约束（必须遵守）】
+1) “次日重点推荐股票（TOP5-8）”必须使用 Markdown 表格输出，不得改成列表或段落。
+2) “高风险警示股票（TOP3-5）”必须使用 Markdown 表格输出，不得改成列表或段落。
+3) 表格字段固定如下：
+   - 次日重点推荐股票表：序号 | 股票名称 | 股票代码 | 推荐理由（含题材线索） | 确定性评级 | 买入时机建议 | 交易触发条件 | 持有周期建议
+   - 高风险警示股票表：序号 | 股票名称 | 股票代码 | 风险原因 | 风险等级 | 规避建议
+4) “推荐理由（含题材线索）”必须显式包含至少1-2个来自“题材线索/题材词”的关键词。
+5) 两个表格均按优先级从高到低排序。
+6) 优先使用白名单题材词；仅当该股词池为空时，允许补“AI知识标签：xxx”。
+7) 写到具体股票时，禁止跨股票借词；若该股词池为空，允许仅对该股使用AI知识标签。
+8) 当“推荐分层配额约束”为开启时，次日重点推荐股票表必须严格满足“推荐总数”和“近涨停标签占比上限”。
+9) “确定性评级/买入时机建议/交易触发条件/持有周期建议”禁止使用“待定/暂无/N/A/观察”等占位词，必须给出可执行建议。
+
+请给出专业、全面、可执行的首席策略师综合报告。报告要有明确结论和可操作性。
 """
         
         messages = [
@@ -1035,6 +1287,100 @@ class LonghubangAgents:
             "focus_areas": ["综合研判", "推荐股票", "风险警示", "热点题材", "操作策略"],
             "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
         }
+
+    def repair_recommendation_advice(
+        self,
+        recommended_stocks: List[Dict[str, Any]],
+        chief_analysis: str = "",
+    ) -> str:
+        """
+        二次补全推荐理由与建议字段（补全详细理由+确定性/买点/触发条件/持有周期）。
+        返回Markdown表文本，供引擎解析回填。
+        """
+        items = []
+        for x in (recommended_stocks or [])[:12]:
+            code = self._normalize_code(x.get("code", ""))
+            if not code:
+                continue
+            items.append(
+                f"- {x.get('name', '')}({code}) | 理由: {x.get('reason', '')} | 当前: "
+                f"确定性={x.get('confidence', '')}, 买入={x.get('buy_price', '')}, "
+                f"触发={x.get('target_price', '')}, 持有={x.get('hold_period', '')}"
+            )
+        if not items:
+            return ""
+
+        prompt = f"""
+你是短线交易策略顾问。请仅对给定股票补全“详细推荐理由+交易建议字段”。
+
+【待补全股票】
+{chr(10).join(items)}
+
+【首席报告摘要（可参考）】
+{str(chief_analysis or '')[:3000]}
+
+【输出硬约束】
+1) 仅输出一个Markdown表格，不要输出任何解释文字。
+2) 表头固定：股票代码 | 推荐理由（详细） | 确定性评级 | 买入时机建议 | 交易触发条件 | 持有周期建议
+3) 每只股票必须一行，覆盖全部给定股票代码。
+4) 禁止使用“待定/暂无/N/A/观察”等占位词。
+5) 推荐理由必须是完整句，至少包含：资金面依据 + 题材/逻辑依据 + 次日观察重点（可合并成一段）。
+6) 建议必须可执行，且不写具体价格数字。
+7) 禁止直接复述输入里的模板片段（如“资金净流入XX；题材线索XX”），必须改写成自然语言总结，语气专业且可读。
+8) 推荐理由尽量先总结“为什么值得关注”，再补“次日看什么信号”，避免生硬罗列。
+"""
+        messages = [
+            {"role": "system", "content": "你是资深短线交易策略顾问，擅长给出可执行建议。"},
+            {"role": "user", "content": prompt},
+        ]
+        return self._run_agent_call("建议字段补全器", messages, max_tokens=1800)
+
+    def repair_chief_recommendation_table(
+        self,
+        chief_analysis: str,
+        candidate_quota_context: str,
+        candidate_kline_context: str = "",
+        recommendation_count: int = 8,
+        recommendation_limit_up_ratio: float = 0.4,
+    ) -> str:
+        """
+        当首席推荐表不满足分层配额时，触发一次AI重选，仅输出“次日重点推荐股票”Markdown表格。
+        """
+        rec_count = max(3, min(int(recommendation_count or 8), 12))
+        ratio = max(0.0, min(float(recommendation_limit_up_ratio or 0.4), 1.0))
+        max_limit_like = int(rec_count * ratio + 1e-9)
+        min_non_limit_like = max(0, rec_count - max_limit_like)
+
+        prompt = f"""
+你是首席投资策略师的“推荐表修正助手”。
+你的任务：在不改变整体报告观点的前提下，重选“次日重点推荐股票”表，确保满足分层配额。
+
+【原首席报告（节选）】
+{str(chief_analysis or '')[:3500]}
+
+【候选池与字段说明（系统口径）】
+{candidate_quota_context}
+{candidate_kline_context}
+
+【硬性约束】
+1) 仅可从候选池明细中的股票代码中选择，不得新增候选池外股票。
+2) 推荐总数必须为 {rec_count} 只。
+3) 近涨停标签（is_limit_like_for_quota=是）最多 {max_limit_like} 只。
+4) 非近涨停（is_limit_like_for_quota=否）至少 {min_non_limit_like} 只。
+5) 优先保留原报告核心逻辑（资金/题材/风险），但配额不满足时必须优先满足配额。
+6) 不要出现“待定/暂无/N/A/观察”等占位词。
+7) 可参考9日日线趋势字段（trend_stage/change_7d_pct/latest_change_pct 等）做强弱筛选，但其权重低于资金与题材主信号。
+
+【输出格式（必须严格）】
+- 仅输出一个 Markdown 表格，不要任何额外文字。
+- 表头固定为：
+| 序号 | 股票名称 | 股票代码 | 推荐理由（含题材线索） | 确定性评级 | 买入时机建议 | 交易触发条件 | 持有周期建议 |
+"""
+        messages = [
+            {"role": "system", "content": "你是资深首席投资策略师，擅长在约束条件下给出可执行推荐表。"},
+            {"role": "user", "content": prompt},
+        ]
+        return self._run_agent_call("首席推荐表修正器", messages, max_tokens=2200)
 
 
 # 测试函数

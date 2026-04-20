@@ -1,5 +1,5 @@
 """
-龙虎榜7日K线趋势信号（Tushare daily）
+龙虎榜短窗K线趋势信号（Tushare daily）
 按交易日快照拉取后在内存匹配股票，避免逐股高频请求。
 """
 
@@ -12,21 +12,23 @@ import pandas as pd
 
 from data_source_manager import data_source_manager
 from tushare_proxy_rate_limit import call_tushare_with_timeout
+from trade_calendar_service import TradeCalendarService
 
 
 class SevenDayKlineTrendFetcher:
-    """基于 Tushare daily 的7日趋势阶段识别"""
+    """基于 Tushare daily 的短窗趋势阶段识别（默认9日）"""
 
     def __init__(self):
         self.data_source_manager = data_source_manager
+        self.trade_calendar = TradeCalendarService()
 
     def get_trend_data(
         self,
-        days: int = 7,
+        days: int = 9,
         end_date: Optional[str] = None,
         stock_codes: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        window_days = max(min(int(days or 7), 7), 3)
+        window_days = max(min(int(days or 9), 9), 5)
         result: Dict[str, Any] = {
             "data_success": False,
             "source": "tushare.daily",
@@ -48,7 +50,7 @@ class SevenDayKlineTrendFetcher:
 
         target_codes = self._normalize_codes(stock_codes or [])
         if not target_codes:
-            result["error"] = "未提供龙虎榜股票代码，跳过7日趋势阶段识别"
+            result["error"] = "未提供龙虎榜股票代码，跳过K线趋势阶段识别"
             return result
         target_set = set(target_codes)
 
@@ -78,7 +80,7 @@ class SevenDayKlineTrendFetcher:
             stock_trend_map[code] = detail
 
         if not stock_trend_map:
-            result["error"] = "未获取到有效的7日K线趋势数据"
+            result["error"] = "未获取到有效的K线趋势数据"
             return result
 
         stage_counter = Counter(str(v.get("trend_stage", "")) for v in stock_trend_map.values())
@@ -119,9 +121,9 @@ class SevenDayKlineTrendFetcher:
     def _fetch_trade_date_snapshot(self, trade_date: str) -> Optional[pd.DataFrame]:
         pro = self.data_source_manager.tushare_api
         candidates = [
-            {"trade_date": trade_date, "fields": "ts_code,trade_date,close,pct_chg,vol"},
+            {"trade_date": trade_date, "fields": "ts_code,trade_date,open,high,low,close,pct_chg,vol"},
             {"trade_date": trade_date},
-            {"date": trade_date, "fields": "ts_code,trade_date,close,pct_chg,vol"},
+            {"date": trade_date, "fields": "ts_code,trade_date,open,high,low,close,pct_chg,vol"},
             {"date": trade_date},
         ]
         for kwargs in candidates:
@@ -147,6 +149,9 @@ class SevenDayKlineTrendFetcher:
             return []
         date_col = self._find_col(df, ["trade_date", "date", "日期"])
         close_col = self._find_col(df, ["close", "收盘"])
+        open_col = self._find_col(df, ["open", "开盘"])
+        high_col = self._find_col(df, ["high", "最高"])
+        low_col = self._find_col(df, ["low", "最低"])
         pct_col = self._find_col(df, ["pct_chg", "pct_change", "涨跌幅", "pct"])
         vol_col = self._find_col(df, ["vol", "volume", "成交量"])
         name_col = self._find_col(df, ["name", "股票名称", "简称"])
@@ -163,6 +168,9 @@ class SevenDayKlineTrendFetcher:
                 {
                     "code": code,
                     "trade_date": self._norm_trade_date(row.get(date_col)) if date_col else "",
+                    "open": float(self._safe_number(row.get(open_col))) if open_col else 0.0,
+                    "high": float(self._safe_number(row.get(high_col))) if high_col else 0.0,
+                    "low": float(self._safe_number(row.get(low_col))) if low_col else 0.0,
                     "close": float(close_val),
                     "pct_chg": float(self._safe_number(row.get(pct_col))) if pct_col else 0.0,
                     "vol": float(self._safe_number(row.get(vol_col))) if vol_col else 0.0,
@@ -199,6 +207,9 @@ class SevenDayKlineTrendFetcher:
                 returns.append((curr - prev) / prev * 100.0)
 
         latest_close = closes[-1]
+        latest_open = float(rows[-1].get("open", 0.0) or 0.0)
+        latest_high = float(rows[-1].get("high", 0.0) or 0.0)
+        latest_low = float(rows[-1].get("low", 0.0) or 0.0)
         first_close = closes[0]
         low_close = min(closes)
         total_change = (latest_close - first_close) / first_close * 100.0 if first_close > 0 else 0.0
@@ -226,28 +237,39 @@ class SevenDayKlineTrendFetcher:
             if prev_avg > 0:
                 vol_ratio = vols[-1] / prev_avg
 
+        # K线形态：用于高位+放量长上影风险识别
+        upper_shadow = max(latest_high - max(latest_open, latest_close), 0.0)
+        lower_shadow = max(min(latest_open, latest_close) - latest_low, 0.0)
+        body = abs(latest_close - latest_open)
+        day_range = max(latest_high - latest_low, 1e-6)
+        upper_shadow_ratio = upper_shadow / day_range
+        body_ratio = body / day_range
+        latest_near_high = 0.0
+        if latest_high > 0:
+            latest_near_high = (latest_close - latest_low) / max(day_range, 1e-6)
+
         stage = "震荡期"
-        reason = "7日内涨跌交替，趋势不够连续"
+        reason = "近窗内涨跌交替，趋势不够连续"
         if total_change <= -4 or (up_days <= 2 and latest_change <= -1.0):
             stage = "退潮期"
-            reason = "7日累计涨幅弱且下跌日偏多"
+            reason = "近窗累计涨幅弱且下跌日偏多"
         elif total_change >= 14 and up_days >= 5:
             if up_streak >= 2:
                 stage = "加速期"
-                reason = "7日累计涨幅高且保持连阳"
+                reason = "近窗累计涨幅高且保持连阳"
             else:
                 stage = "高位震荡"
-                reason = "7日累计涨幅高，但短线出现高位分歧"
+                reason = "近窗累计涨幅高，但短线出现高位分歧"
         elif total_change >= 8 and up_days >= 4:
             if up_streak >= 2:
                 stage = "加速期"
-                reason = "7日趋势持续上行，资金推动明显"
+                reason = "近窗趋势持续上行，资金推动明显"
             else:
                 stage = "高位震荡"
                 reason = "已有明显涨幅，近期分歧增大"
         elif total_change >= 3 and up_days >= 3:
             stage = "启动期"
-            reason = "7日开始走强，但尚未进入高斜率阶段"
+            reason = "近窗开始走强，但尚未进入高斜率阶段"
 
         trend_score_map = {
             "加速期": 1.0,
@@ -271,6 +293,13 @@ class SevenDayKlineTrendFetcher:
             "latest_close": round(float(latest_close), 3),
             "high_7d": round(float(max_close), 3),
             "low_7d": round(float(low_close), 3),
+            "latest_open": round(float(latest_open), 3),
+            "latest_high": round(float(latest_high), 3),
+            "latest_low": round(float(latest_low), 3),
+            "latest_upper_shadow_ratio": round(float(upper_shadow_ratio), 3),
+            "latest_body_ratio": round(float(body_ratio), 3),
+            "latest_near_high_ratio": round(float(latest_near_high), 3),
+            "latest_upper_shadow_pct": round(float(upper_shadow / max(latest_close, 1e-6) * 100.0), 2),
             "latest_trade_date": self._fmt_trade_date(rows[-1].get("trade_date", "")),
             "name": rows[-1].get("name", ""),
         }
@@ -302,17 +331,8 @@ class SevenDayKlineTrendFetcher:
         return ""
 
     def _build_recent_trade_dates(self, days: int, end_date: Optional[str] = None) -> List[str]:
-        if end_date:
-            end_dt = self._parse_date(end_date) or datetime.now()
-        else:
-            end_dt = datetime.now()
-        out: List[str] = []
-        cur = end_dt
-        while len(out) < days and len(out) < 25:
-            if cur.weekday() < 5:
-                out.append(cur.strftime("%Y%m%d"))
-            cur -= timedelta(days=1)
-        return out
+        end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        return self.trade_calendar.recent_open_days(end8, max(int(days or 0), 1))
 
     def _find_col(self, df: pd.DataFrame, keywords: List[str]) -> str:
         for col in df.columns:

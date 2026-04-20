@@ -15,6 +15,7 @@ import pandas as pd
 
 from data_source_manager import data_source_manager
 from tushare_proxy_rate_limit import throttle_tushare_proxy_request, call_tushare_with_timeout
+from trade_calendar_service import TradeCalendarService
 
 
 class LimitStepHeatFetcher:
@@ -22,6 +23,7 @@ class LimitStepHeatFetcher:
 
     def __init__(self):
         self.data_source_manager = data_source_manager
+        self.trade_calendar = TradeCalendarService()
 
     def get_heat_data(
         self,
@@ -339,17 +341,8 @@ class LimitStepHeatFetcher:
         return 0
 
     def _build_recent_trade_dates(self, days: int, end_date: Optional[str] = None) -> List[str]:
-        if end_date:
-            end_dt = self._parse_date(end_date) or datetime.now()
-        else:
-            end_dt = datetime.now()
-        out: List[str] = []
-        cur = end_dt
-        while len(out) < days and len(out) < 15:
-            if cur.weekday() < 5:
-                out.append(cur.strftime("%Y%m%d"))
-            cur -= timedelta(days=1)
-        return out
+        end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        return self.trade_calendar.recent_open_days(end8, max(int(days or 0), 1))
 
     def _find_col(self, df: pd.DataFrame, keywords: List[str]) -> str:
         for col in df.columns:
@@ -451,6 +444,7 @@ class THSHotHeatFetcher:
 
     def __init__(self):
         self.data_source_manager = data_source_manager
+        self.trade_calendar = TradeCalendarService()
 
     def get_hot_data(
         self,
@@ -669,17 +663,8 @@ class THSHotHeatFetcher:
         return 0.15
 
     def _build_recent_trade_dates(self, days: int, end_date: Optional[str] = None) -> List[str]:
-        if end_date:
-            end_dt = self._parse_date(end_date) or datetime.now()
-        else:
-            end_dt = datetime.now()
-        out: List[str] = []
-        cur = end_dt
-        while len(out) < days and len(out) < 10:
-            if cur.weekday() < 5:
-                out.append(cur.strftime("%Y%m%d"))
-            cur -= timedelta(days=1)
-        return out
+        end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        return self.trade_calendar.recent_open_days(end8, max(int(days or 0), 1))
 
     def _find_col(self, df: pd.DataFrame, keywords: List[str]) -> str:
         for col in df.columns:
@@ -754,6 +739,7 @@ class KPLListHeatFetcher:
 
     def __init__(self):
         self.data_source_manager = data_source_manager
+        self.trade_calendar = TradeCalendarService()
 
     def get_heat_data(
         self,
@@ -934,12 +920,13 @@ class KPLListHeatFetcher:
     def _fetch_trade_date_snapshot(self, trade_date: str) -> Optional[pd.DataFrame]:
         """按交易日拉取整日热榜快照，后续在内存中按股票代码匹配。"""
         pro = self.data_source_manager.tushare_api
-        candidates = [
-            {"trade_date": trade_date, "tag": "涨停"},
-            {"trade_date": trade_date},
-            {"date": trade_date, "tag": "涨停"},
-            {"date": trade_date},
-        ]
+        candidates = []
+        for tag in ["涨停", "自然涨停", "炸板", "跌停"]:
+            candidates.append({"trade_date": trade_date, "tag": tag})
+        candidates.append({"trade_date": trade_date})
+        for tag in ["涨停", "自然涨停", "炸板", "跌停"]:
+            candidates.append({"date": trade_date, "tag": tag})
+        candidates.append({"date": trade_date})
         for kwargs in candidates:
             try:
                 df = call_tushare_with_timeout(
@@ -961,12 +948,21 @@ class KPLListHeatFetcher:
         self, start_date: str, end_date: str, query_date: Optional[str] = None
     ) -> Optional[pd.DataFrame]:
         pro = self.data_source_manager.tushare_api
-        candidates = [
-            {"trade_date": query_date, "tag": "涨停"} if query_date else {},
-            {"date": query_date, "tag": "涨停"} if query_date else {},
-            {"start_date": start_date, "end_date": end_date},
-            {"start_date": start_date, "end_date": end_date, "tag": "涨停"},
-        ]
+        candidates = []
+        if query_date:
+            for tag in ["涨停", "自然涨停", "炸板", "跌停"]:
+                candidates.append({"trade_date": query_date, "tag": tag})
+            for tag in ["涨停", "自然涨停", "炸板", "跌停"]:
+                candidates.append({"date": query_date, "tag": tag})
+        candidates.extend(
+            [
+                {"start_date": start_date, "end_date": end_date},
+                {"start_date": start_date, "end_date": end_date, "tag": "涨停"},
+                {"start_date": start_date, "end_date": end_date, "tag": "自然涨停"},
+                {"start_date": start_date, "end_date": end_date, "tag": "炸板"},
+                {"start_date": start_date, "end_date": end_date, "tag": "跌停"},
+            ]
+        )
         for kwargs in candidates:
             if not kwargs:
                 continue
@@ -989,12 +985,16 @@ class KPLListHeatFetcher:
     def _fetch_single_day_data(self, trade_date: str, stock_code: str) -> Optional[pd.DataFrame]:
         pro = self.data_source_manager.tushare_api
         ts_code = self._to_ts_code(stock_code)
-        candidates = [
-            {"trade_date": trade_date, "ts_code": ts_code, "tag": "涨停"},
-            {"trade_date": trade_date, "ts_code": stock_code, "tag": "涨停"},
-            {"trade_date": trade_date, "ts_code": ts_code},
-            {"trade_date": trade_date, "ts_code": stock_code},
-        ]
+        candidates = []
+        for tag in ["涨停", "自然涨停", "炸板", "跌停"]:
+            candidates.append({"trade_date": trade_date, "ts_code": ts_code, "tag": tag})
+            candidates.append({"trade_date": trade_date, "ts_code": stock_code, "tag": tag})
+        candidates.extend(
+            [
+                {"trade_date": trade_date, "ts_code": ts_code},
+                {"trade_date": trade_date, "ts_code": stock_code},
+            ]
+        )
         for kwargs in candidates:
             try:
                 df = call_tushare_with_timeout(
@@ -1045,12 +1045,29 @@ class KPLListHeatFetcher:
         hot_col = self._find_col(df, ["hot", "heat", "热度", "score", "指数"])
         theme_col = self._find_col(df, ["theme", "题材", "概念", "板块", "concept"])
         reason_col = self._find_col(df, ["lu_desc", "reason", "解读", "原因", "逻辑", "备注"])
-        change_col = self._find_col(df, ["pct", "涨跌幅", "change", "涨幅"])
+        # 涨跌幅字段严格匹配，避免误命中金额类 change_* 列
+        change_col = ""
+        for c in [
+            "pct_chg", "pct_change", "change_pct", "涨跌幅", "涨幅", "pct", "changepercent",
+        ]:
+            if c in df.columns:
+                change_col = c
+                break
+        if not change_col:
+            for col in df.columns:
+                name = str(col).strip().lower()
+                if name in {"pct_chg", "pct_change", "change_pct", "pct", "涨跌幅", "涨幅", "changepercent"}:
+                    change_col = col
+                    break
+        tag_col = self._find_col(df, ["tag", "标签", "类型", "类别"])
 
         rows: List[Dict[str, Any]] = []
         for idx, row in df.iterrows():
             code = self._normalize_code(row.get(code_col))
             if not code:
+                continue
+            tag_text = self._clean_text(row.get(tag_col)) if tag_col else ""
+            if "竞价" in tag_text:
                 continue
             name = self._clean_text(row.get(name_col)) if name_col else ""
             rank = int(round(self._safe_number(row.get(rank_col)))) if rank_col else int(idx) + 1
@@ -1060,6 +1077,9 @@ class KPLListHeatFetcher:
             themes = self._split_themes(row.get(theme_col)) if theme_col else []
             reason = self._clean_text(row.get(reason_col)) if reason_col else ""
             change_pct = self._safe_number(row.get(change_col)) if change_col else 0.0
+            # 防御性阈值：超过正常日涨跌幅范围，视为字段误映射，置0
+            if abs(float(change_pct)) > 60:
+                change_pct = 0.0
             rows.append(
                 {
                     "code": code,
@@ -1104,6 +1124,8 @@ class KPLListHeatFetcher:
             theme = self._clean_text(part)
             if not theme or theme in noise or theme.isdigit() or len(theme) < 2:
                 continue
+            if self._is_st_theme(theme):
+                continue
             out.append(theme)
         dedup: List[str] = []
         seen = set()
@@ -1113,18 +1135,18 @@ class KPLListHeatFetcher:
                 dedup.append(theme)
         return dedup[:6]
 
+    def _is_st_theme(self, theme: str) -> bool:
+        text = self._clean_text(theme)
+        if not text:
+            return False
+        upper = text.upper()
+        if text == "ST板块" or "风险警示" in text:
+            return True
+        return bool(re.search(r"(^|\b)\*?ST(\b|$)", upper))
+
     def _build_recent_trade_dates(self, days: int, end_date: Optional[str] = None) -> List[str]:
-        if end_date:
-            end_dt = self._parse_date(end_date) or datetime.now()
-        else:
-            end_dt = datetime.now()
-        out: List[str] = []
-        cur = end_dt
-        while len(out) < days and len(out) < 10:
-            if cur.weekday() < 5:
-                out.append(cur.strftime("%Y%m%d"))
-            cur -= timedelta(days=1)
-        return out
+        end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        return self.trade_calendar.recent_open_days(end8, max(int(days or 0), 1))
 
     def _find_col(self, df: pd.DataFrame, keywords: List[str]) -> str:
         for col in df.columns:
@@ -1199,6 +1221,7 @@ class LimitCPTHeatFetcher:
 
     def __init__(self):
         self.data_source_manager = data_source_manager
+        self.trade_calendar = TradeCalendarService()
 
     def get_heat_data(self, days: int = 5, end_date: Optional[str] = None) -> Dict[str, Any]:
         result: Dict[str, Any] = {
@@ -1435,17 +1458,8 @@ class LimitCPTHeatFetcher:
         return out[:100]
 
     def _build_recent_trade_dates(self, days: int, end_date: Optional[str] = None) -> List[str]:
-        if end_date:
-            end_dt = self._parse_date(end_date) or datetime.now()
-        else:
-            end_dt = datetime.now()
-        out: List[str] = []
-        cur = end_dt
-        while len(out) < days and len(out) < 15:
-            if cur.weekday() < 5:
-                out.append(cur.strftime("%Y%m%d"))
-            cur -= timedelta(days=1)
-        return out
+        end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        return self.trade_calendar.recent_open_days(end8, max(int(days or 0), 1))
 
     def _find_col(self, df: pd.DataFrame, keywords: List[str]) -> str:
         for col in df.columns:

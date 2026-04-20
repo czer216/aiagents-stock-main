@@ -69,7 +69,7 @@ class LonghubangScoring:
         institution_score = self._calculate_institution_score(stock_data, p1_signal_data)
         
         # 5. 其他加分项 (0-4分)
-        bonus_score = self._calculate_bonus_score(stock_data)
+        bonus_score = self._calculate_bonus_score(stock_data, p1_signal_data)
 
         # 6. 板块轮动评分 (0-15分)
         rotation_score = self._calculate_board_rotation_score(
@@ -236,7 +236,11 @@ class LonghubangScoring:
                 boost += 0.4
             if youzi_hits > 0:
                 boost += min(youzi_pos / max(youzi_hits, 1), 1.0) * 0.45
-            mapped_score += min(boost, 2.2)
+            # 主力资金持续性加分
+            consecutive_days = int(p1.get("main_inflow_consecutive_days", 0) or 0)
+            if consecutive_days >= 3:
+                boost += 0.5
+            mapped_score += min(boost, 2.7)
         return round(min(mapped_score, max_score), 2)
     
     def _calculate_sell_pressure_score(
@@ -370,9 +374,13 @@ class LonghubangScoring:
                 final_score += 0.8
             if youzi_signal >= 0.8:
                 final_score += 0.5
+            # 机构席位复现率加分
+            inst_recurrence = float(p1.get("inst_seat_recurrence_rate", 0.0) or 0.0)
+            if inst_recurrence >= 0.5:
+                final_score += 0.8
         return min(final_score, max_score)
     
-    def _calculate_bonus_score(self, stock_data: List[Dict]) -> float:
+    def _calculate_bonus_score(self, stock_data: List[Dict], p1_signal_data: Dict[str, Any] = None) -> float:
         """
         计算其他加分项 (0-4分)
         买卖比例、主力集中度、热门概念等
@@ -443,7 +451,14 @@ class LonghubangScoring:
                 score += 0.45
             elif buy_sell_ratio >= 3:
                 score += 0.3
-        
+
+        # 5. 游资席位复现率加分
+        p1 = self._get_p1_detail(stock_data, p1_signal_data)
+        if p1:
+            youzi_recurrence = float(p1.get("youzi_seat_recurrence_rate", 0.0) or 0.0)
+            if youzi_recurrence >= 0.5:
+                score += 0.6
+
         return min(score, max_score)
 
     def _calculate_board_rotation_score(

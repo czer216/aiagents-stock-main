@@ -9,12 +9,16 @@
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 import re
+import time
+import logging
+import sys
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from data_source_manager import data_source_manager
 from tushare_proxy_rate_limit import call_tushare_with_timeout
+from trade_calendar_service import TradeCalendarService
 
 
 class AdvancedP1SignalFetcher:
@@ -22,7 +26,19 @@ class AdvancedP1SignalFetcher:
 
     def __init__(self):
         self.data_source_manager = data_source_manager
+        self.trade_calendar = TradeCalendarService()
         self._next_day_focus = False
+        self._mainboard_limit_up_threshold = 9.5
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(logging.INFO)
+        if not self.logger.handlers:
+            handler = logging.StreamHandler(sys.stdout)
+            handler.setLevel(logging.INFO)
+            handler.setFormatter(
+                logging.Formatter('[%(asctime)s] %(levelname)s %(name)s: %(message)s')
+            )
+            self.logger.addHandler(handler)
+        self.logger.propagate = False
 
     def get_signal_data(
         self,
@@ -30,15 +46,20 @@ class AdvancedP1SignalFetcher:
         end_date: Optional[str] = None,
         stock_codes: Optional[List[str]] = None,
         next_day_focus: bool = False,
+        mainboard_limit_up_threshold_pct: float = 9.5,
     ) -> Dict[str, Any]:
         self._next_day_focus = bool(next_day_focus)
+        self._mainboard_limit_up_threshold = max(
+            1.0, min(float(mainboard_limit_up_threshold_pct or 9.5), 10.0)
+        )
         result: Dict[str, Any] = {
             "data_success": False,
             "source": (
                 "tushare.top_list/top_inst;"
                 "tushare.hm_list/hm_detail;"
                 "tushare.moneyflow_ths/moneyflow_cnt_ths/moneyflow_ind_ths;"
-                "tushare.limit_list_ths/limit_list_d"
+                "tushare.limit_list_ths/limit_list_d;"
+                "tushare.daily_basic/suspend_d"
             ),
             "query_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "stock_signal_map": {},
@@ -68,12 +89,17 @@ class AdvancedP1SignalFetcher:
         if not trade_dates:
             result["error"] = "未生成有效交易日"
             return result
+        self.logger.info(
+            f"[P1] 开始 | mode={'next_day_focus' if self._next_day_focus else 'default'} | "
+            f"days={days} | end_date={end_date or 'latest'} | trade_dates={trade_dates}"
+        )
 
         stock_state: Dict[str, Dict[str, Any]] = {}
         for code in target_codes:
             stock_state[code] = self._init_stock_state(code)
 
         # A) 龙虎榜统计 + 机构明细
+        t0 = time.time()
         self._collect_top_list(pro, trade_dates, target_code_set, stock_state)
         self._collect_top_inst(pro, trade_dates, target_code_set, stock_state)
         hm_profile_data = self._collect_hm_list(pro, trade_dates)
@@ -84,18 +110,30 @@ class AdvancedP1SignalFetcher:
             stock_state=stock_state,
             hm_profile_map=hm_profile_data.get("profile_map", {}) or {},
         )
+        self.logger.info(f"[P1] A阶段完成(top/inst/hm) | elapsed={round(time.time() - t0, 2)}s")
 
         # B) 资金确认（个股/概念/行业）
+        t0 = time.time()
         concept_flow_counter: Counter = Counter()
         industry_flow_counter: Counter = Counter()
         self._collect_moneyflow_stock(pro, trade_dates, target_code_set, stock_state)
         self._collect_moneyflow_concept(pro, trade_dates, concept_flow_counter)
         self._collect_moneyflow_industry(pro, trade_dates, industry_flow_counter)
+        self.logger.info(f"[P1] B阶段完成(moneyflow) | elapsed={round(time.time() - t0, 2)}s")
 
         # C) 封板质量（以分析日为主，兼顾最近数日）
+        t0 = time.time()
         self._collect_limit_quality(pro, trade_dates, target_code_set, stock_state)
+        self.logger.info(f"[P1] C阶段完成(limit_quality) | elapsed={round(time.time() - t0, 2)}s")
+
+        # C2) 日频流动性/停牌状态（daily_basic + suspend_d）
+        t0 = time.time()
+        self._collect_daily_basic(pro, trade_dates, target_code_set, stock_state)
+        self._collect_suspend_status(pro, trade_dates, target_code_set, stock_state)
+        self.logger.info(f"[P1] C2阶段完成(daily_basic+suspend_d) | elapsed={round(time.time() - t0, 2)}s")
 
         # D) 聚合打分
+        t0 = time.time()
         stock_signal_map = self._build_stock_signal_map(stock_state)
         top_candidates = sorted(
             [
@@ -141,6 +179,10 @@ class AdvancedP1SignalFetcher:
             }
         )
         result["data_success"] = bool(stock_signal_map)
+        self.logger.info(
+            f"[P1] D阶段完成(aggregate) | elapsed={round(time.time() - t0, 2)}s | "
+            f"stock_signal_map={len(stock_signal_map)}"
+        )
         if not result["data_success"]:
             result["error"] = "P1增强信号未命中有效数据"
         return result
@@ -216,6 +258,10 @@ class AdvancedP1SignalFetcher:
                 st["inst_buy_amt"] += float(row.get("buy_amt", 0.0) or 0.0)
                 st["inst_sell_amt"] += float(row.get("sell_amt", 0.0) or 0.0)
                 st["inst_net_amt"] += float(row.get("net_amt", 0.0) or 0.0)
+                # 机构席位复现：记录席位名称
+                seat_name = str(row.get("exalter", "") or "").strip()
+                if seat_name:
+                    st["inst_seat_names"].add(seat_name)
 
     def _collect_hm_list(self, pro: Any, trade_dates: List[str]) -> Dict[str, Any]:
         out: Dict[str, Any] = {"profile_map": {}, "top_profiles": []}
@@ -355,6 +401,7 @@ class AdvancedP1SignalFetcher:
                 hm_name = row.get("hm_name", "")
                 if hm_name:
                     st["youzi_name_counter"].update([hm_name])
+                    st["youzi_seat_names"].add(hm_name)
                     profile = hm_profile_map.get(hm_name, {}) or {}
                     st["youzi_profile_score_sum"] += float(profile.get("profile_score", 0.0) or 0.0)
                     style = profile.get("style", "")
@@ -395,9 +442,15 @@ class AdvancedP1SignalFetcher:
                 st["money_hits"] += 1
                 main_net = float(row.get("main_net_amt", 0.0) or 0.0)
                 st["main_net_amt_sum"] += main_net
+                st["money_main_net_seq"].append(main_net)
                 st["money_net_amt_sum"] += float(row.get("net_amt", 0.0) or 0.0)
                 if main_net > 0:
                     st["money_positive_days"] += 1
+                # 资金持续性：连续净流入天数
+                if main_net > 0:
+                    st["main_inflow_consecutive_days"] = st.get("main_inflow_consecutive_days", 0) + 1
+                else:
+                    st["main_inflow_consecutive_days"] = 0
 
     def _collect_moneyflow_concept(
         self,
@@ -461,6 +514,86 @@ class AdvancedP1SignalFetcher:
                 rank_weight = max(0.4, 2.0 - rank_idx * 0.05)
                 industry_flow_counter[industry] += flow / 1e8 * rank_weight * decay
 
+    def _collect_daily_basic(
+        self,
+        pro: Any,
+        trade_dates: List[str],
+        target_code_set: set,
+        stock_state: Dict[str, Dict[str, Any]],
+    ) -> None:
+        if not hasattr(pro, "daily_basic"):
+            return
+        for trade_date in trade_dates:
+            df = self._call_api_with_candidates(
+                pro.daily_basic,
+                api_name="daily_basic",
+                candidates=[
+                    {"trade_date": trade_date},
+                    {"date": trade_date},
+                ],
+            )
+            if df is None or df.empty:
+                continue
+            code_col = self._find_col(df, ["ts_code", "code", "股票代码", "证券代码"])
+            if not code_col:
+                continue
+            turnover_col = self._find_col(df, ["turnover_rate", "turnover", "换手"])
+            vol_ratio_col = self._find_col(df, ["volume_ratio", "量比"])
+            circ_mv_col = self._find_col(df, ["circ_mv", "流通市值"])
+            for _, row in df.iterrows():
+                code = self._normalize_code(row.get(code_col))
+                if code not in target_code_set:
+                    continue
+                st = stock_state.get(code)
+                if st is None:
+                    continue
+                st["daily_basic_hits"] += 1
+                st["daily_basic_turnover_sum"] += float(self._safe_number(row.get(turnover_col))) if turnover_col else 0.0
+                st["daily_basic_vol_ratio_sum"] += float(self._safe_number(row.get(vol_ratio_col))) if vol_ratio_col else 0.0
+                st["daily_basic_circ_mv_sum"] += float(self._safe_number(row.get(circ_mv_col))) if circ_mv_col else 0.0
+
+    def _collect_suspend_status(
+        self,
+        pro: Any,
+        trade_dates: List[str],
+        target_code_set: set,
+        stock_state: Dict[str, Dict[str, Any]],
+    ) -> None:
+        if not hasattr(pro, "suspend_d"):
+            return
+        today = trade_dates[0] if trade_dates else ""
+        for trade_date in trade_dates:
+            df = self._call_api_with_candidates(
+                pro.suspend_d,
+                api_name="suspend_d",
+                candidates=[
+                    {"trade_date": trade_date},
+                    {"date": trade_date},
+                ],
+            )
+            if df is None or df.empty:
+                continue
+            code_col = self._find_col(df, ["ts_code", "code", "股票代码", "证券代码"])
+            date_col = self._find_col(df, ["trade_date", "date", "日期"])
+            suspend_type_col = self._find_col(df, ["suspend_type", "停复牌类型", "类型"])
+            if not code_col:
+                continue
+            for _, row in df.iterrows():
+                code = self._normalize_code(row.get(code_col))
+                if code not in target_code_set:
+                    continue
+                st = stock_state.get(code)
+                if st is None:
+                    continue
+                suspend_type = str(row.get(suspend_type_col) or "").strip().upper() if suspend_type_col else ""
+                # 仅统计“停牌”
+                if suspend_type and ("R" in suspend_type):
+                    continue
+                st["suspend_days"] += 1
+                d = self._norm_trade_date(str(row.get(date_col) or trade_date)) if date_col else trade_date
+                if today and d == today:
+                    st["is_suspended_today"] = True
+
     def _collect_limit_quality(
         self,
         pro: Any,
@@ -474,17 +607,26 @@ class AdvancedP1SignalFetcher:
             return
 
         # 封板质量以分析日为主，最多回看3个交易日
-        for trade_date in trade_dates[:3]:
+        for idx, trade_date in enumerate(trade_dates[:3]):
+            is_today = idx == 0
             if has_ths:
-                df = self._call_api_with_candidates(
-                    pro.limit_list_ths,
-                    api_name="limit_list_ths",
-                    candidates=[
-                        {"trade_date": trade_date},
-                        {"date": trade_date},
-                    ],
-                )
-                self._merge_limit_rows(df, target_code_set, stock_state)
+                for limit_type in ["涨停池", "连板池", "连扳池"]:
+                    df = self._call_api_with_candidates(
+                        pro.limit_list_ths,
+                        api_name="limit_list_ths",
+                        candidates=[
+                            {"trade_date": trade_date, "limit_type": limit_type},
+                            {"date": trade_date, "limit_type": limit_type},
+                        ],
+                    )
+                    self._merge_limit_rows(
+                        df,
+                        target_code_set,
+                        stock_state,
+                        is_today=is_today,
+                        source_api="limit_list_ths",
+                        request_limit_type=limit_type,
+                    )
 
             if has_d:
                 df = self._call_api_with_candidates(
@@ -495,13 +637,23 @@ class AdvancedP1SignalFetcher:
                         {"date": trade_date},
                     ],
                 )
-                self._merge_limit_rows(df, target_code_set, stock_state)
+                self._merge_limit_rows(
+                    df,
+                    target_code_set,
+                    stock_state,
+                    is_today=is_today,
+                    source_api="limit_list_d",
+                    request_limit_type="",
+                )
 
     def _merge_limit_rows(
         self,
         df: Optional[pd.DataFrame],
         target_code_set: set,
         stock_state: Dict[str, Dict[str, Any]],
+        is_today: bool = False,
+        source_api: str = "",
+        request_limit_type: str = "",
     ) -> None:
         if df is None or df.empty:
             return
@@ -519,6 +671,18 @@ class AdvancedP1SignalFetcher:
             st["fd_amount_sum"] += float(row.get("fd_amount", 0.0) or 0.0)
             st["limit_times_max"] = max(st["limit_times_max"], int(row.get("limit_times", 0) or 0))
             st["seal_quality_sum"] += float(row.get("seal_quality", 0.0) or 0.0)
+            if is_today:
+                status_text = str(row.get("status", "") or "")
+                row_limit_type = str(row.get("limit_type", "") or "").strip()
+                type_text = row_limit_type or str(request_limit_type or "").strip()
+                type_text = type_text.replace(" ", "")
+                # 用户要求：封板质量显示仅依据 limit_list_ths.limit_type 是否为涨停池/连板池(连扳池)
+                is_limit_type_hit = type_text in {"涨停池", "连板池", "连扳池"}
+                is_limit_up = (str(source_api).lower() == "limit_list_ths") and is_limit_type_hit
+                if is_limit_up:
+                    st["today_limit_up_hit"] = True
+                    if status_text:
+                        st["today_limit_up_status"] = status_text
 
     def _build_stock_signal_map(self, stock_state: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
@@ -623,12 +787,26 @@ class AdvancedP1SignalFetcher:
                 "main_net_amt_avg": round(main_net_avg, 2),
                 "money_positive_days": int(money_pos_days),
                 "money_hits": int(money_hits),
+                "consecutive_main_outflow_2d": bool(
+                    len(st.get("money_main_net_seq", []) or []) >= 2
+                    and float((st.get("money_main_net_seq", [0.0, 0.0])[0])) < 0
+                    and float((st.get("money_main_net_seq", [0.0, 0.0])[1])) < 0
+                ),
                 "limit_hits": int(limit_hits),
                 "open_times_avg": round(open_times_avg, 2),
                 "fd_amount_avg": round(fd_amount_avg, 2),
                 "seal_quality": round(seal_quality_avg, 3),
-                "limit_times": int(st.get("limit_times_max", 0) or 0),
+                "turnover_rate_avg": round(float(st.get("daily_basic_turnover_sum", 0.0) or 0.0) / max(int(st.get("daily_basic_hits", 0) or 0), 1), 3),
+                "volume_ratio_avg": round(float(st.get("daily_basic_vol_ratio_sum", 0.0) or 0.0) / max(int(st.get("daily_basic_hits", 0) or 0), 1), 3),
+                "circ_mv_avg_wan": round(float(st.get("daily_basic_circ_mv_sum", 0.0) or 0.0) / max(int(st.get("daily_basic_hits", 0) or 0), 1), 2),
+                "suspend_days": int(st.get("suspend_days", 0) or 0),
+                "is_suspended_today": bool(st.get("is_suspended_today", False)),
+                "today_limit_up_hit": bool(st.get("today_limit_up_hit", False)),
+                "today_limit_up_status": str(st.get("today_limit_up_status", "") or ""),
                 "top_reason": top_reason,
+                "main_inflow_consecutive_days": int(st.get("main_inflow_consecutive_days", 0) or 0),
+                "inst_seat_recurrence_rate": round(len(st.get("inst_seat_names", set()) or set()) / max(int(st.get("inst_hits", 0) or 0), 1), 3),
+                "youzi_seat_recurrence_rate": round(len(st.get("youzi_seat_names", set()) or set()) / max(int(st.get("youzi_hits", 0) or 0), 1), 3),
                 "youzi_hits": int(youzi_hits),
                 "youzi_net_amt_sum": round(youzi_net_sum, 2),
                 "youzi_positive_hits": int(youzi_pos),
@@ -870,6 +1048,8 @@ class AdvancedP1SignalFetcher:
         if not code_col:
             return []
         name_col = self._find_col(df, ["name", "股票名称", "简称"])
+        pct_col = self._find_col(df, ["pct_chg", "pct", "涨跌幅", "change"])
+        type_col = self._find_col(df, ["limit_type", "类型", "tag"])
         open_col = self._find_col(df, ["open_num", "open_times", "炸板", "开板"])
         fd_col = self._find_col(df, ["fd_amount", "封单", "封板资金"])
         limit_times_col = self._find_col(df, ["limit_times", "连板", "板数", "up_stat"])
@@ -884,6 +1064,7 @@ class AdvancedP1SignalFetcher:
                 continue
             open_times = int(round(self._safe_number(row.get(open_col)))) if open_col else 0
             fd_amount = self._safe_number(row.get(fd_col)) if fd_col else 0.0
+            pct_chg = self._safe_number(row.get(pct_col)) if pct_col else 0.0
             limit_times = self._parse_limit_times(row.get(limit_times_col)) if limit_times_col else 0
             first_time = self._clean_text(row.get(first_col)) if first_col else ""
             last_time = self._clean_text(row.get(last_col)) if last_col else ""
@@ -902,6 +1083,8 @@ class AdvancedP1SignalFetcher:
                     "name": self._clean_text(row.get(name_col)) if name_col else "",
                     "open_times": max(open_times, 0),
                     "fd_amount": max(fd_amount, 0.0),
+                    "pct_chg": float(pct_chg or 0.0),
+                    "limit_type": self._clean_text(row.get(type_col)) if type_col else "",
                     "limit_times": max(limit_times, 0),
                     "first_time": first_time,
                     "last_time": last_time,
@@ -962,21 +1145,34 @@ class AdvancedP1SignalFetcher:
         api_name: str,
         candidates: List[Dict[str, Any]],
     ) -> Optional[pd.DataFrame]:
-        for kwargs in candidates:
+        for idx, kwargs in enumerate(candidates, 1):
+            started = time.time()
+            self.logger.info(f"[P1][{api_name}] 尝试{idx}/{len(candidates)} | params={kwargs}")
             try:
                 df = call_tushare_with_timeout(
                     api_callable=lambda: api_callable(**kwargs),
                     timeout_sec=60,
                     api_name=api_name,
+                    logger=self.logger,
                 )
             except TypeError:
+                self.logger.info(f"[P1][{api_name}] 参数不兼容，跳过 | params={kwargs}")
                 continue
             except TimeoutError:
+                self.logger.warning(f"[P1][{api_name}] 超时，继续下一候选 | params={kwargs}")
                 continue
             except Exception:
+                self.logger.warning(f"[P1][{api_name}] 请求异常，继续下一候选 | params={kwargs}")
                 continue
             if isinstance(df, pd.DataFrame) and not df.empty:
+                self.logger.info(
+                    f"[P1][{api_name}] 命中有效数据 | rows={len(df)} | elapsed={round(time.time() - started, 2)}s"
+                )
                 return df
+            self.logger.info(
+                f"[P1][{api_name}] 返回空数据 | elapsed={round(time.time() - started, 2)}s"
+            )
+        self.logger.info(f"[P1][{api_name}] 所有候选参数均未命中数据")
         return None
 
     def _init_stock_state(self, code: str) -> Dict[str, Any]:
@@ -994,7 +1190,11 @@ class AdvancedP1SignalFetcher:
             "money_hits": 0,
             "money_net_amt_sum": 0.0,
             "main_net_amt_sum": 0.0,
+            "money_main_net_seq": [],
             "money_positive_days": 0,
+            "main_inflow_consecutive_days": 0,
+            "inst_seat_names": set(),
+            "youzi_seat_names": set(),
             "youzi_hits": 0,
             "youzi_buy_amt_sum": 0.0,
             "youzi_sell_amt_sum": 0.0,
@@ -1009,20 +1209,19 @@ class AdvancedP1SignalFetcher:
             "fd_amount_sum": 0.0,
             "limit_times_max": 0,
             "seal_quality_sum": 0.0,
+            "today_limit_up_hit": False,
+            "today_limit_up_status": "",
+            "daily_basic_hits": 0,
+            "daily_basic_turnover_sum": 0.0,
+            "daily_basic_vol_ratio_sum": 0.0,
+            "daily_basic_circ_mv_sum": 0.0,
+            "suspend_days": 0,
+            "is_suspended_today": False,
         }
 
     def _build_recent_trade_dates(self, days: int, end_date: Optional[str] = None) -> List[str]:
-        if end_date:
-            end_dt = self._parse_date(end_date) or datetime.now()
-        else:
-            end_dt = datetime.now()
-        out: List[str] = []
-        cur = end_dt
-        while len(out) < days and len(out) < 10:
-            if cur.weekday() < 5:
-                out.append(cur.strftime("%Y%m%d"))
-            cur -= timedelta(days=1)
-        return out
+        end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        return self.trade_calendar.recent_open_days(end8, max(int(days or 0), 1))
 
     def _normalize_codes(self, codes: List[Any]) -> List[str]:
         out: List[str] = []
@@ -1041,12 +1240,12 @@ class AdvancedP1SignalFetcher:
         if "." in text:
             base, suffix = text.split(".", 1)
             suffix = suffix.upper()
-            if suffix not in ("SH", "SZ"):
+            if suffix not in ("SH", "SZ", "BJ"):
                 return ""
-            if len(base) == 6 and base.isdigit() and base[0] in ("0", "3", "6"):
+            if len(base) == 6 and base.isdigit() and base[0] in ("0", "3", "4", "6", "8"):
                 return base
             return ""
-        if len(text) == 6 and text.isdigit() and text[0] in ("0", "3", "6"):
+        if len(text) == 6 and text.isdigit() and text[0] in ("0", "3", "4", "6", "8"):
             return text
         return ""
 
@@ -1078,6 +1277,14 @@ class AdvancedP1SignalFetcher:
         if not text or text.lower() == "nan":
             return ""
         return re.sub(r"\s+", " ", text)
+
+    def _norm_trade_date(self, value: Any) -> str:
+        text = self._clean_text(value)
+        parsed = self._parse_date(text)
+        if parsed:
+            return parsed.strftime("%Y%m%d")
+        m = re.search(r"(\d{8})", text)
+        return m.group(1) if m else ""
 
     def _parse_date(self, value: str) -> Optional[datetime]:
         if not value:
