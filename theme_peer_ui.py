@@ -95,6 +95,9 @@ def display_theme_peer_selector():
                         stock_code=symbol.strip(),
                         min_cooccur_count=min_cooccur,
                         top_n=top_n,
+                        with_realtime=True,
+                        realtime_timeout_sec=2.5,
+                        realtime_weight=0.35,
                     )
                     st.session_state["theme_peer_result"] = result
                 except Exception as e:
@@ -120,11 +123,25 @@ def _render_result(result: Dict[str, Any]):
     peer_stocks = result.get("peer_stocks") or []
 
     st.success("✅ 查询完成")
+    with_realtime = bool(result.get("with_realtime", False))
+    realtime_weight = float(result.get("realtime_weight", 0.35) or 0.35)
+    realtime_meta = dict(result.get("realtime_meta") or {})
+    realtime_base = str(realtime_meta.get("base_url", "") or "")
+    realtime_ok = int(realtime_meta.get("ok_count", 0) or 0)
+    realtime_total = int(realtime_meta.get("total", 0) or 0)
+    target_rt = result.get("target_realtime_pct_chg", None)
+    if target_rt is not None:
+        target_rt_text = f"{float(target_rt):+.2f}%"
+    else:
+        target_rt_text = "--"
     st.markdown(
-        f"**目标股票**: {stock_code} {stock_name}  |  "
+        f"**目标股票**: {stock_code} {stock_name}（实时{target_rt_text}）  |  "
         f"**参与题材**: {'、'.join(themes[:8]) if themes else '暂无'}  |  "
-        f"**找到**: {len(peer_stocks)} 只同题材跟涨股票"
+        f"**找到**: {len(peer_stocks)} 只同题材跟涨股票  |  "
+        f"**实时增强**: {'开启' if with_realtime else '关闭'}（权重{realtime_weight:.2f}）"
     )
+    if with_realtime:
+        st.caption(f"实时接口: {realtime_base or '-'} | 实时成功: {realtime_ok}/{realtime_total}")
 
     if not peer_stocks:
         st.warning("未找到符合条件的同题材跟涨股票")
@@ -139,6 +156,10 @@ def _render_result(result: Dict[str, Any]):
         "name": "名称",
         "cooccur_count": "共现次数",
         "avg_pct_chg": "历史平均涨幅%",
+        "realtime_pct_chg": "实时涨跌幅%",
+        "fusion_score": "融合得分",
+        "realtime_update_time": "更新时间",
+        "realtime_status": "实时状态",
         "themes": "题材",
     }
     df = df.rename(columns=rename_map)
@@ -149,8 +170,22 @@ def _render_result(result: Dict[str, Any]):
             lambda x: "、".join(x[:5]) if isinstance(x, list) else str(x)
         )
 
+    if "实时状态" in df.columns:
+        df["实时状态"] = df["实时状态"].apply(
+            lambda x: "正常" if str(x) == "ok" else ("超时" if str(x) == "timeout" else "回退")
+        )
+
     # 添加排名列
     df.insert(0, "排名", range(1, len(df) + 1))
+
+    # 固定展示列顺序（实时涨跌幅在历史平均涨幅左侧）
+    preferred_order = [
+        "排名", "代码", "名称", "共现次数", "实时涨跌幅%", "历史平均涨幅%",
+        "融合得分", "更新时间", "实时状态", "题材",
+    ]
+    ordered_columns = [col for col in preferred_order if col in df.columns]
+    remaining_columns = [col for col in df.columns if col not in ordered_columns]
+    df = df[ordered_columns + remaining_columns]
 
     # 显示表格
     st.dataframe(
@@ -167,6 +202,18 @@ def _render_result(result: Dict[str, Any]):
                 format="%.2f%%",
                 width="medium",
             ),
+            "实时涨跌幅%": st.column_config.NumberColumn(
+                "实时涨跌幅%",
+                format="%.2f%%",
+                width="medium",
+            ),
+            "融合得分": st.column_config.NumberColumn(
+                "融合得分",
+                format="%.2f",
+                width="small",
+            ),
+            "更新时间": st.column_config.TextColumn("更新时间", width="large"),
+            "实时状态": st.column_config.TextColumn("实时状态", width="small"),
             "题材": st.column_config.TextColumn("题材", width="large"),
         },
     )

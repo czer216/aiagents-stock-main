@@ -6,7 +6,7 @@
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional
 import logging
 
@@ -325,7 +325,16 @@ class SmartMonitorKline:
                 from smart_monitor_data import SmartMonitorDataFetcher
                 data_fetcher = SmartMonitorDataFetcher()
             
-            # 方法1: 尝试使用TDX获取（如果启用）
+            # 方法1: 优先使用Tushare
+            if data_fetcher and data_fetcher.ts_pro:
+                self.logger.info(f"优先使用Tushare获取K线数据 {stock_code}")
+                df = self._get_kline_from_tushare(stock_code, days, data_fetcher.ts_pro)
+                if df is not None and not df.empty:
+                    self.logger.info(f"✅ Tushare获取K线数据成功 {stock_code}，共{len(df)}条")
+                    return df
+                self.logger.warning(f"Tushare未返回有效K线数据 {stock_code}，尝试降级到TDX")
+
+            # 方法2: 尝试使用TDX获取（如果启用）
             if hasattr(data_fetcher, 'use_tdx') and data_fetcher.use_tdx and data_fetcher.tdx_fetcher:
                 try:
                     df = data_fetcher.tdx_fetcher.get_kline_data(stock_code, kline_type='day', limit=days)
@@ -333,15 +342,15 @@ class SmartMonitorKline:
                         self.logger.info(f"✅ TDX获取K线数据成功 {stock_code}，共{len(df)}条")
                         return df
                     else:
-                        self.logger.warning(f"TDX未返回K线数据 {stock_code}，尝试降级到AKShare")
+                        self.logger.warning(f"TDX未返回K线数据 {stock_code}，尝试降级���AKShare")
                 except Exception as e:
                     self.logger.warning(f"TDX获取K线数据失败 {stock_code}: {type(e).__name__}, 尝试降级到AKShare")
-            
+
             # 计算日期范围
             end_date = datetime.now().strftime('%Y%m%d')
             start_date = (datetime.now() - timedelta(days=days + 30)).strftime('%Y%m%d')  # 多取30天以确保足够数据
-            
-            # 方法2: 尝试使用AKShare获取（只尝试1次，避免IP封禁）
+
+            # 方法3: 尝试使用AKShare获取（只尝试1次，避免IP封禁）
             try:
                 import akshare as ak
                 df = ak.stock_zh_a_hist(
@@ -351,24 +360,16 @@ class SmartMonitorKline:
                     end_date=end_date,
                     adjust='qfq'
                 )
-                
+
                 if df is not None and not df.empty:
                     # 只保留最近days天的数据
                     df = df.tail(days)
                     self.logger.info(f"✅ AKShare获取K线数据成功 {stock_code}，共{len(df)}条")
                     return df
                 else:
-                    self.logger.warning(f"AKShare未返回K线数据 {stock_code}，尝试降级到Tushare")
+                    self.logger.warning(f"AKShare未返回K线数据 {stock_code}")
             except Exception as e:
-                self.logger.warning(f"AKShare获取K线数据失败 {stock_code}: {type(e).__name__}, 尝试降级到Tushare")
-            
-            # 方法3: 降级到Tushare
-            if data_fetcher and data_fetcher.ts_pro:
-                self.logger.info(f"降级使用Tushare获取K线数据 {stock_code}")
-                df = self._get_kline_from_tushare(stock_code, days, data_fetcher.ts_pro)
-                if df is not None and not df.empty:
-                    self.logger.info(f"✅ Tushare获取K线数据成功 {stock_code}，共{len(df)}条")
-                    return df
+                self.logger.warning(f"AKShare获取K线数据失败 {stock_code}: {type(e).__name__}")
             
             self.logger.error(f"所有数据源都无法获取K线数据 {stock_code}")
             return None
@@ -379,7 +380,61 @@ class SmartMonitorKline:
             self.logger.debug(traceback.format_exc())
             return None
     
-    def _get_kline_from_tushare(self, stock_code: str, days: int, ts_pro) -> Optional[pd.DataFrame]:
+    def get_kline_by_range(
+        self,
+        stock_code: str,
+        start_date: str,
+        end_date: str,
+        data_fetcher=None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取指定日期区间K线（统一返回含 日期/开盘/收盘/最高/最低/成交量 列的数据）。
+        """
+        try:
+            start_dt = self._parse_any_date(start_date)
+            end_dt = self._parse_any_date(end_date)
+            if start_dt is None or end_dt is None:
+                return None
+            if start_dt > end_dt:
+                start_dt, end_dt = end_dt, start_dt
+
+            extend_days = max((end_dt - start_dt).days + 40, 80)
+            df = self.get_kline_data(stock_code=stock_code, days=extend_days, data_fetcher=data_fetcher)
+            if df is None or df.empty or '日期' not in df.columns:
+                return None
+
+            out = df.copy()
+            out['日期'] = pd.to_datetime(out['日期'], errors='coerce')
+            out = out.dropna(subset=['日期'])
+            out = out[(out['日期'] >= pd.Timestamp(start_dt)) & (out['日期'] <= pd.Timestamp(end_dt))]
+            if out.empty:
+                return None
+            return out.sort_values('日期').reset_index(drop=True)
+        except Exception as e:
+            self.logger.error(f"按区间获取K线失败 {stock_code}: {e}")
+            return None
+
+    def _parse_any_date(self, value) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, date):
+            return datetime.combine(value, datetime.min.time())
+        text = str(value).strip()
+        if not text:
+            return None
+        text = text.replace('/', '-').replace('.', '-')
+        for fmt in ("%Y-%m-%d", "%Y%m%d", "%Y-%m", "%Y%m"):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                if fmt in ("%Y-%m", "%Y%m"):
+                    parsed = datetime(parsed.year, parsed.month, 1)
+                return parsed
+            except Exception:
+                continue
+        return None
+
         """
         从Tushare获取K线数据
         

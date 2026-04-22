@@ -13,6 +13,8 @@ import logging
 import re
 import sqlite3
 import time
+import os
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -24,6 +26,7 @@ from data_source_manager import data_source_manager
 from longhubang_data import LonghubangDataFetcher
 from tushare_proxy_rate_limit import call_tushare_with_timeout
 from trade_calendar_service import TradeCalendarService, TradeCalendarError
+import config
 
 
 class LonghubangHistoryService:
@@ -411,6 +414,30 @@ class LonghubangHistoryService:
                 low_pos = (low_anchor_pct - pct) / max(low_anchor_pct, 1.0)
                 low_pos = max(0.0, min(low_pos, 1.0))
             next_scale = max(min((hist_next + 2.0) / 8.0, 1.0), 0.0)
+
+            # 共现增强（提前计算，供胜率守门使用）
+            cooccur_score = 0.0
+            cooccur_frequency = 0
+            cooccur_win_rate = 0.0
+            cooccur_avg_return = 0.0
+            if code in cooccur_map:
+                cooccur_data = cooccur_map[code]
+                cooccur_frequency = int(cooccur_data.get("frequency", 0))
+                cooccur_win_rate = float(cooccur_data.get("win_rate", 0.0))
+                cooccur_avg_return = float(cooccur_data.get("avg_return", 0.0))
+                freq_norm = min(cooccur_frequency / 5.0, 1.0)
+                return_norm = max(min((cooccur_avg_return + 2.0) / 8.0, 1.0), 0.0)
+                cooccur_score = (0.4 * freq_norm + 0.3 * cooccur_win_rate + 0.3 * return_norm) * 100.0
+
+            # 胜率守门1：高位追涨（只在高位+强拉升+后段状态同时出现时过滤）
+            if self._should_filter_high_chase(stock=stock):
+                continue
+
+            # 胜率守门2：低历史胜率 + 共现弱，直接过滤
+            cooccur_strong = (cooccur_frequency >= 2) or (cooccur_win_rate >= 0.55)
+            if hist_win < 0.38 and not cooccur_strong:
+                continue
+
             high_zone_penalty, high_zone_reason = self._calc_high_zone_penalty(
                 pct_chg=pct,
                 low_anchor_pct=float(low_anchor_pct),
@@ -418,7 +445,6 @@ class LonghubangHistoryService:
                 is_limit_like=bool(is_limit_like),
             )
             hist_samples = int(self._calc_hist_samples_for_matched_themes(matched, hist_theme_stats))
-            # 计算平均收益路径特征用于置信度
             hist_return_5d_avg = (hist_return_5d_sum / max(hist_return_samples, 1)) if hist_return_samples > 0 else 0.0
             hist_max_dd_avg = (hist_max_dd_sum / max(hist_return_samples, 1)) if hist_return_samples > 0 else 0.0
             confidence_factor = self._calc_peer_confidence_factor(
@@ -429,33 +455,34 @@ class LonghubangHistoryService:
                 hist_return_5d_avg=float(hist_return_5d_avg),
                 hist_max_dd_avg=float(hist_max_dd_avg),
             )
+
+            kline_9d_score = self._calc_kline_9d_score(stock=stock)
+            kline_availability_multiplier, kline_data_availability = self._calc_kline_data_availability(stock=stock)
+            kline_9d_bonus = 10.0 * kline_9d_score * kline_availability_multiplier
+
             score = (
                 45.0 * today_strength
                 + 28.0 * hist_win
                 + 22.0 * low_pos
                 + 5.0 * next_scale
             ) * max(match_weight, 0.45)
-            score = score * confidence_factor - high_zone_penalty
+            score = score * confidence_factor - high_zone_penalty + kline_9d_bonus
 
-            # 共现增强
-            cooccur_score = 0.0
-            cooccur_frequency = 0
-            cooccur_win_rate = 0.0
-            cooccur_avg_return = 0.0
-            if code in cooccur_map:
-                cooccur_data = cooccur_map[code]
-                cooccur_frequency = int(cooccur_data.get("frequency", 0))
-                cooccur_win_rate = float(cooccur_data.get("win_rate", 0.0))
-                cooccur_avg_return = float(cooccur_data.get("avg_return", 0.0))
+            # 当日涨幅偏大只做软约束，不做硬过滤
+            intraday_follow_penalty = 0.0
+            if pct >= max(low_anchor_pct + 4.0, 9.0):
+                intraday_follow_penalty += 1.2
+            if pct >= max(low_anchor_pct + 6.0, 11.0):
+                intraday_follow_penalty += 1.3
+            score -= intraday_follow_penalty
 
-                # 计算共现强度分
-                freq_norm = min(cooccur_frequency / 5.0, 1.0)
-                return_norm = max(min((cooccur_avg_return + 2.0) / 8.0, 1.0), 0.0)
-                cooccur_score = 0.4 * freq_norm + 0.3 * cooccur_win_rate + 0.3 * return_norm
-                cooccur_score = cooccur_score * 100.0
-
-                # 融合共现分到最终得分
+            # 融合共现分到最终得分
+            if cooccur_score > 0.0:
                 score = 0.7 * score + 0.3 * cooccur_score
+
+            # 中低历史胜率：软降权（保留候选）
+            if 0.38 <= hist_win < 0.45:
+                score *= 0.92
 
             if is_limit_like:
                 score *= 0.72
@@ -482,6 +509,9 @@ class LonghubangHistoryService:
                     "low_position_anchor_pct": round(float(low_anchor_pct), 2),
                     "low_position_score": round(low_pos, 3),
                     "peer_confidence_factor": round(float(confidence_factor), 3),
+                    "kline_9d_score": round(float(kline_9d_score), 3),
+                    "kline_data_availability": str(kline_data_availability),
+                    "kline_9d_bonus": round(float(kline_9d_bonus), 2),
                     "high_zone_penalty": round(float(high_zone_penalty), 2),
                     "high_zone_reason": str(high_zone_reason or ""),
                     "cooccur_frequency": cooccur_frequency,
@@ -807,6 +837,86 @@ class LonghubangHistoryService:
             + dd_penalty
         )
         return round(max(0.65, min(factor, 1.12)), 3)
+
+    def _calc_kline_data_availability(self, stock: Dict[str, Any]) -> Any:
+        trend_stage = str(stock.get("kline_trend_stage", "") or "").strip()
+        has_stage = bool(trend_stage)
+        has_change = stock.get("kline_change_7d_pct") is not None
+        has_drawdown = stock.get("kline_drawdown_from_high_pct") is not None
+        has_vol = stock.get("kline_vol_ratio") is not None
+        available_count = sum([1 if has_stage else 0, 1 if has_change else 0, 1 if has_drawdown else 0, 1 if has_vol else 0])
+        if available_count >= 4:
+            return 1.0, "full"
+        if available_count >= 2:
+            return 0.6, "partial"
+        return 0.35, "missing"
+
+    def _calc_kline_9d_score(self, stock: Dict[str, Any]) -> float:
+        trend_stage = str(stock.get("kline_trend_stage", "") or "").strip()
+        change_9d = float(stock.get("kline_change_7d_pct", 0.0) or 0.0)
+        drawdown = float(stock.get("kline_drawdown_from_high_pct", 0.0) or 0.0)
+        vol_ratio = float(stock.get("kline_vol_ratio", 1.0) or 1.0)
+
+        stage_map = {
+            "启动期": 0.92,
+            "震荡期": 0.72,
+            "加速期": 0.38,
+            "高位震荡": 0.28,
+            "退潮期": 0.22,
+        }
+        stage_score = stage_map.get(trend_stage, 0.55)
+
+        # 9日涨幅：偏好温和上涨，过热不加分
+        if change_9d <= 0:
+            change_score = 0.35
+        elif change_9d <= 6:
+            change_score = 0.86
+        elif change_9d <= 12:
+            change_score = 0.72
+        elif change_9d <= 18:
+            change_score = 0.46
+        else:
+            change_score = 0.15
+
+        # 离高点回撤：中低位更优
+        if drawdown <= -12:
+            drawdown_score = 0.32
+        elif drawdown <= -7:
+            drawdown_score = 0.70
+        elif drawdown <= -3:
+            drawdown_score = 0.90
+        elif drawdown <= -1:
+            drawdown_score = 0.62
+        else:
+            drawdown_score = 0.35
+
+        # 量比：适中最好
+        if vol_ratio <= 0.7:
+            vol_score = 0.42
+        elif vol_ratio <= 1.8:
+            vol_score = 0.88
+        elif vol_ratio <= 2.8:
+            vol_score = 0.68
+        else:
+            vol_score = 0.45
+
+        score = 0.40 * stage_score + 0.30 * change_score + 0.20 * drawdown_score + 0.10 * vol_score
+
+        # 高位末段不奖励
+        if trend_stage in {"加速期", "高位震荡"} and change_9d >= 18 and drawdown >= -2.5:
+            score *= 0.45
+
+        return round(max(0.0, min(score, 1.0)), 3)
+
+    def _should_filter_high_chase(self, stock: Dict[str, Any]) -> bool:
+        trend_stage = str(stock.get("kline_trend_stage", "") or "").strip()
+        change_9d = float(stock.get("kline_change_7d_pct", 0.0) or 0.0)
+        drawdown = float(stock.get("kline_drawdown_from_high_pct", 0.0) or 0.0)
+        return (
+            change_9d >= 18.0
+            and drawdown >= -2.5
+            and trend_stage in {"加速期", "高位震荡"}
+        )
 
     def _calc_high_zone_penalty(
         self,
@@ -1988,12 +2098,126 @@ class LonghubangHistoryService:
         text = re.sub(r"\s+", "", text)
         return text
 
+    def _fetch_batch_realtime_quotes(self, codes: List[str], timeout_sec: float = 2.5) -> Dict[str, Dict[str, Any]]:
+        code_list = [self._normalize_code(c) for c in (codes or [])]
+        code_list = [c for c in code_list if c]
+        if not code_list:
+            self._last_realtime_meta = {"base_url": "", "status": "empty_codes"}
+            return {}
+
+        url_candidates = [
+            str(os.getenv("TDX_BASE_URL", "") or "").strip().rstrip("/"),
+            str((config.TDX_CONFIG or {}).get("base_url", "") or "").strip().rstrip("/"),
+            # docker compose 服务名互联（优先）
+            "http://tdx-stock-web:8080",
+            "http://stock-web:8080",
+            # 容器内尝试宿主机映射地址
+            "http://host.docker.internal:8080",
+            "http://host.docker.internal:8181",
+            "http://localhost:8080",
+            "http://127.0.0.1:8080",
+            "http://172.17.0.1:8080",
+            "http://172.17.0.1:8181",
+            "http://192.168.1.222:8181",
+        ]
+        seen = set()
+        urls = []
+        for u in url_candidates:
+            if u and u not in seen:
+                seen.add(u)
+                urls.append(u)
+
+        payload = {}
+        used_url = ""
+        timeout_flag = False
+        for base_url in urls:
+            try:
+                resp = requests.post(
+                    f"{base_url}/api/batch-quote",
+                    headers={"Content-Type": "application/json"},
+                    data=json.dumps({"codes": code_list}, ensure_ascii=False),
+                    timeout=max(0.8, float(timeout_sec or 2.5)),
+                )
+                payload = resp.json() if resp is not None else {}
+                if isinstance(payload, dict) and int(payload.get("code", -1)) == 0:
+                    used_url = base_url
+                    break
+            except requests.exceptions.Timeout:
+                timeout_flag = True
+                continue
+            except Exception:
+                continue
+
+        if not used_url:
+            self._last_realtime_meta = {"base_url": urls[0] if urls else "", "status": "timeout" if timeout_flag else "fallback"}
+            status = "timeout" if timeout_flag else "fallback"
+            return {c: {"realtime_pct_chg": None, "realtime_update_time": "", "realtime_status": status} for c in code_list}
+
+        data_list = payload.get("data", []) or []
+        out: Dict[str, Dict[str, Any]] = {
+            c: {"realtime_pct_chg": None, "realtime_update_time": "", "realtime_status": "fallback"}
+            for c in code_list
+        }
+
+        for item in data_list:
+            code = self._normalize_code(item.get("Code", ""))
+            if not code:
+                continue
+            k = item.get("K", {}) or {}
+            try:
+                close = float(k.get("Close", 0.0) or 0.0) / 1000.0
+                last = float(k.get("Last", 0.0) or 0.0) / 1000.0
+                rt = ((close - last) / last * 100.0) if last > 0 else None
+            except Exception:
+                rt = None
+
+            server_time = int(item.get("ServerTime", 0) or 0)
+            update_time = ""
+            if server_time > 0:
+                try:
+                    # TDX常见返回：HHMMSSxx（不是Unix时间戳）
+                    st = str(server_time)
+                    if len(st) <= 8:
+                        digits = st.zfill(8)
+                        hh = int(digits[0:2])
+                        mm = int(digits[2:4])
+                        ss = int(digits[4:6])
+                        # 合法时分秒则按“今天+时分秒”拼接
+                        if 0 <= hh < 24 and 0 <= mm < 60 and 0 <= ss < 60:
+                            today = datetime.now().strftime("%Y-%m-%d")
+                            update_time = f"{today} {hh:02d}:{mm:02d}:{ss:02d}"
+                        else:
+                            update_time = ""
+                    else:
+                        # 兼容部分实现返回秒/毫秒时间戳
+                        ts = server_time / 1000.0 if server_time > 10_000_000_000 else float(server_time)
+                        dt = datetime.fromtimestamp(ts)
+                        if dt.year >= 2020:
+                            update_time = dt.strftime("%Y-%m-%d %H:%M:%S")
+                        else:
+                            update_time = ""
+                except Exception:
+                    update_time = ""
+
+            out[code] = {
+                "realtime_pct_chg": round(float(rt), 2) if rt is not None else None,
+                "realtime_update_time": update_time,
+                "realtime_status": "ok" if rt is not None else "fallback",
+            }
+
+        ok_count = sum(1 for x in out.values() if str(x.get("realtime_status", "")) == "ok")
+        self._last_realtime_meta = {"base_url": used_url, "status": "ok", "ok_count": ok_count, "total": len(code_list)}
+        return out
+
     def query_theme_peer_stocks(
         self,
         stock_code: str,
         before_date: Optional[str] = None,
         min_cooccur_count: int = 2,
         top_n: int = 20,
+        with_realtime: bool = False,
+        realtime_timeout_sec: float = 2.5,
+        realtime_weight: float = 0.35,
     ) -> Dict[str, Any]:
         """
         查询历史上与指定股票同题材一起上榜的其他股票
@@ -2003,6 +2227,9 @@ class LonghubangHistoryService:
             before_date: 查询截止日期（不含），默认为今天
             min_cooccur_count: 最小共现次数，默认2次
             top_n: 返回前N个结果，默认20
+            with_realtime: 是否接入TDX实时涨跌幅并做融合排序
+            realtime_timeout_sec: TDX批量请求超时（秒）
+            realtime_weight: 实时涨跌幅融合权重（0~1）
 
         Returns:
             {
@@ -2059,7 +2286,11 @@ class LonghubangHistoryService:
             if t not in themes:
                 themes.append(t)
 
-        # 2. 查询这些群组中的其他成员股票
+        # 2. 查询这些群组中的其他成员股票（先扩候选池用于融合重排）
+        top_n_int = max(1, int(top_n or 20))
+        fetch_limit = min(max(top_n_int * 3, top_n_int), 60)
+        realtime_w = max(0.0, min(float(realtime_weight or 0.35), 1.0))
+
         placeholders = ",".join(["?"] * len(group_ids))
         query = f"""
             SELECT
@@ -2078,7 +2309,7 @@ class LonghubangHistoryService:
             LIMIT ?
         """
 
-        params = group_ids + [code, min_cooccur_count, top_n]
+        params = group_ids + [code, min_cooccur_count, fetch_limit]
 
         try:
             rows = conn.execute(query, params).fetchall()
@@ -2111,7 +2342,67 @@ class LonghubangHistoryService:
                 "cooccur_count": cooccur_count,
                 "avg_pct_chg": round(avg_pct_chg, 2),
                 "themes": peer_themes[:5],
+                "realtime_pct_chg": None,
+                "realtime_update_time": "",
+                "realtime_status": "fallback",
+                "fusion_score": round(avg_pct_chg, 2),
             })
+
+        target_realtime_pct_chg = None
+        target_realtime_update_time = ""
+        target_realtime_status = "disabled"
+
+        # 3. 可选：接入TDX实时涨跌幅并融合排序
+        if with_realtime:
+            quote_codes = [x.get("code", "") for x in peer_stocks]
+            if code not in quote_codes:
+                quote_codes.append(code)
+            quote_map = self._fetch_batch_realtime_quotes(
+                quote_codes,
+                timeout_sec=float(realtime_timeout_sec or 2.5),
+            )
+
+            target_quote = quote_map.get(code, {}) if quote_map else {}
+            target_rt = target_quote.get("realtime_pct_chg", None)
+            if target_rt is not None:
+                target_realtime_pct_chg = round(float(target_rt), 2)
+            target_realtime_update_time = str(target_quote.get("realtime_update_time", "") or "")
+            target_realtime_status = str(target_quote.get("realtime_status", "fallback") or "fallback")
+
+            for item in peer_stocks:
+                code_i = str(item.get("code", "") or "")
+                hist_pct = float(item.get("avg_pct_chg", 0.0) or 0.0)
+                quote = quote_map.get(code_i, {}) if quote_map else {}
+                rt = quote.get("realtime_pct_chg", None)
+                if rt is None:
+                    rt_fallback = 0.60 * hist_pct
+                    fusion = (1.0 - realtime_w) * hist_pct + realtime_w * rt_fallback - 0.15
+                    item["realtime_pct_chg"] = None
+                    item["realtime_update_time"] = str(quote.get("realtime_update_time", "") or "")
+                    item["realtime_status"] = str(quote.get("realtime_status", "fallback") or "fallback")
+                    item["fusion_score"] = round(fusion, 2)
+                else:
+                    rt_val = float(rt)
+                    fusion = (1.0 - realtime_w) * hist_pct + realtime_w * rt_val
+                    item["realtime_pct_chg"] = round(rt_val, 2)
+                    item["realtime_update_time"] = str(quote.get("realtime_update_time", "") or "")
+                    item["realtime_status"] = str(quote.get("realtime_status", "ok") or "ok")
+                    item["fusion_score"] = round(fusion, 2)
+
+            peer_stocks.sort(
+                key=lambda x: (
+                    float(x.get("fusion_score", 0.0) or 0.0),
+                    int(x.get("cooccur_count", 0) or 0),
+                    float(x.get("avg_pct_chg", 0.0) or 0.0),
+                ),
+                reverse=True,
+            )
+        else:
+            for item in peer_stocks:
+                hist_pct = float(item.get("avg_pct_chg", 0.0) or 0.0)
+                item["fusion_score"] = round(hist_pct, 2)
+
+        peer_stocks = peer_stocks[:top_n_int]
 
         conn.close()
 
@@ -2129,4 +2420,10 @@ class LonghubangHistoryService:
             "themes": themes,
             "peer_stocks": peer_stocks,
             "error": "",
+            "with_realtime": bool(with_realtime),
+            "realtime_weight": round(realtime_w, 3),
+            "realtime_meta": dict(getattr(self, "_last_realtime_meta", {}) or {}),
+            "target_realtime_pct_chg": target_realtime_pct_chg,
+            "target_realtime_update_time": target_realtime_update_time,
+            "target_realtime_status": target_realtime_status,
         }

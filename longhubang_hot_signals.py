@@ -809,7 +809,7 @@ class KPLListHeatFetcher:
                     {
                         "trade_date": trade_date,
                         "rank": rec.get("rank", 9999),
-                        "hot_value": rec.get("hot_value", 0.0),
+                        "change_pct": rec.get("change_pct", 0.0),
                         "themes": themes,
                         "name": rec.get("name", ""),
                     }
@@ -854,18 +854,18 @@ class KPLListHeatFetcher:
 
         # 计算个股KPL热度映射
         tmp_rows: Dict[str, Dict[str, Any]] = {}
-        avg_hot_list: List[float] = []
+        avg_chg_list: List[float] = []
         for code, items in per_stock.items():
             items = sorted(items, key=lambda x: x["trade_date"], reverse=True)
             best_rank = min([int(x.get("rank", 9999) or 9999) for x in items])
             latest_rank = int(items[0].get("rank", 9999) or 9999)
             appear_days = len(items)
-            avg_hot = (
-                sum(float(x.get("hot_value", 0.0) or 0.0) for x in items if float(x.get("hot_value", 0.0) or 0.0) > 0)
-                / max(sum(1 for x in items if float(x.get("hot_value", 0.0) or 0.0) > 0), 1)
+            avg_chg = (
+                sum(float(x.get("change_pct", 0.0) or 0.0) for x in items)
+                / max(len(items), 1)
             )
-            if avg_hot > 0:
-                avg_hot_list.append(avg_hot)
+            if avg_chg > 0:
+                avg_chg_list.append(avg_chg)
             theme_counter = Counter()
             for x in items:
                 for theme in (x.get("themes", []) or []):
@@ -875,18 +875,18 @@ class KPLListHeatFetcher:
                 "best_rank": best_rank,
                 "latest_rank": latest_rank,
                 "appear_days": appear_days,
-                "avg_hot": round(avg_hot, 2),
+                "avg_chg": round(avg_chg, 2),
                 "themes": [t for t, _ in theme_counter.most_common(5)],
             }
 
-        max_avg_hot = max(avg_hot_list) if avg_hot_list else 0.0
+        max_avg_chg = max(avg_chg_list) if avg_chg_list else 0.0
         stock_kpl_map: Dict[str, Dict[str, Any]] = {}
         for code, row in tmp_rows.items():
             score = self._rank_to_score(int(row.get("best_rank", 9999) or 9999))
             score += min(int(row.get("appear_days", 0) or 0) * 0.08, 0.2)
-            avg_hot = float(row.get("avg_hot", 0.0) or 0.0)
-            if max_avg_hot > 0 and avg_hot > 0:
-                score += min(avg_hot / max_avg_hot * 0.15, 0.15)
+            avg_chg = float(row.get("avg_chg", 0.0) or 0.0)
+            if max_avg_chg > 0 and avg_chg > 0:
+                score += min(avg_chg / max_avg_chg * 0.15, 0.15)
             stock_kpl_map[code] = {
                 "score": round(min(score, 1.0), 2),
                 **row,
@@ -1042,7 +1042,6 @@ class KPLListHeatFetcher:
             return []
         name_col = self._find_col(df, ["stock_name", "name", "股票名称", "简称", "gpmc"])
         rank_col = self._find_col(df, ["rank", "排名", "序号", "no"])
-        hot_col = self._find_col(df, ["hot", "heat", "热度", "score", "指数"])
         theme_col = self._find_col(df, ["theme", "题材", "概念", "板块", "concept"])
         reason_col = self._find_col(df, ["lu_desc", "reason", "解读", "原因", "逻辑", "备注"])
         # 涨跌幅字段严格匹配，避免误命中金额类 change_* 列
@@ -1070,10 +1069,8 @@ class KPLListHeatFetcher:
             if "竞价" in tag_text:
                 continue
             name = self._clean_text(row.get(name_col)) if name_col else ""
-            rank = int(round(self._safe_number(row.get(rank_col)))) if rank_col else int(idx) + 1
-            if rank <= 0:
-                rank = int(idx) + 1
-            hot_value = self._safe_number(row.get(hot_col)) if hot_col else 0.0
+            raw_rank = self._safe_number(row.get(rank_col)) if rank_col else 0.0
+            rank = int(round(raw_rank)) if raw_rank > 0 else 0
             themes = self._split_themes(row.get(theme_col)) if theme_col else []
             reason = self._clean_text(row.get(reason_col)) if reason_col else ""
             change_pct = self._safe_number(row.get(change_col)) if change_col else 0.0
@@ -1085,7 +1082,6 @@ class KPLListHeatFetcher:
                     "code": code,
                     "name": name,
                     "rank": int(rank),
-                    "hot_value": round(hot_value, 2),
                     "themes": themes,
                     "themes_text": "、".join(themes[:3]) if themes else "",
                     "reason": reason[:80] if reason else "",
@@ -1096,10 +1092,42 @@ class KPLListHeatFetcher:
         dedup: Dict[str, Dict[str, Any]] = {}
         for item in rows:
             old = dedup.get(item["code"])
-            if old is None or item["rank"] < old["rank"]:
+            if old is None:
                 dedup[item["code"]] = item
+                continue
+            old_rank = int(old.get("rank", 0) or 0)
+            new_rank = int(item.get("rank", 0) or 0)
+            if old_rank > 0 and new_rank > 0:
+                if new_rank < old_rank:
+                    dedup[item["code"]] = item
+                continue
+            if old_rank <= 0 < new_rank:
+                dedup[item["code"]] = item
+                continue
+            if new_rank <= 0:
+                old_chg = float(old.get("change_pct", 0.0) or 0.0)
+                new_chg = float(item.get("change_pct", 0.0) or 0.0)
+                if new_chg > old_chg:
+                    dedup[item["code"]] = item
+
         out = list(dedup.values())
-        out.sort(key=lambda x: (x["rank"], -x.get("hot_value", 0.0)))
+        out.sort(
+            key=lambda x: (
+                0 if int(x.get("rank", 0) or 0) > 0 else 1,
+                int(x.get("rank", 0) or 999999),
+                -float(x.get("change_pct", 0.0) or 0.0),
+            )
+        )
+
+        next_rank = 1
+        for item in out:
+            cur = int(item.get("rank", 0) or 0)
+            if cur > 0:
+                if cur >= next_rank:
+                    next_rank = cur + 1
+                continue
+            item["rank"] = next_rank
+            next_rank += 1
         return out[:120]
 
     def _rank_to_score(self, rank: int) -> float:

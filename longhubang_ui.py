@@ -237,22 +237,62 @@ def display_analysis_tab():
         else:
             st.warning(f"题材候选加载失败：{preview.get('error', '无可用数据')}")
 
+    if "longhubang_user_concept_scores" not in st.session_state:
+        st.session_state["longhubang_user_concept_scores"] = {}
+
     concept_candidates = st.session_state.get("longhubang_concept_candidates", []) or []
+    enable_user_concept_scoring = st.checkbox(
+        "启用用户题材打分融合",
+        value=False,
+        help="为题材设置-2~2主观看法：负分偏分歧调整，正分偏次日走强",
+    )
+    user_concept_score_scale = st.slider(
+        "用户打分影响系数",
+        min_value=0.1,
+        max_value=0.6,
+        value=0.35,
+        step=0.05,
+        help="影响系数越高，用户题材打分对推荐排序影响越大",
+        disabled=not enable_user_concept_scoring,
+    )
+
+    user_concept_scores = dict(st.session_state.get("longhubang_user_concept_scores", {}) or {})
     if concept_candidates:
-        df_concepts = pd.DataFrame(concept_candidates)
-        st.dataframe(
-            df_concepts.head(15),
+        df_concepts = pd.DataFrame(concept_candidates).head(15).copy()
+        df_concepts["user_score"] = df_concepts["concept"].apply(
+            lambda c: float(user_concept_scores.get(str(c), 0.0) or 0.0)
+        )
+        edited_df = st.data_editor(
+            df_concepts,
             column_config={
-                "rank": st.column_config.NumberColumn("排序", format="%d", width="small"),
-                "concept": st.column_config.TextColumn("题材", width="medium"),
-                "strength_100": st.column_config.NumberColumn("强度分", format="%.2f"),
-                "count": st.column_config.NumberColumn("出现次数", format="%d"),
-                "pct_chg": st.column_config.NumberColumn("涨跌幅", format="%.2f"),
-                "source": st.column_config.TextColumn("来源", width="small"),
+                "rank": st.column_config.NumberColumn("排序", format="%d", width="small", disabled=True),
+                "concept": st.column_config.TextColumn("题材", width="medium", disabled=True),
+                "strength_100": st.column_config.NumberColumn("强度分", format="%.2f", disabled=True),
+                "count": st.column_config.NumberColumn("出现次数", format="%d", disabled=True),
+                "pct_chg": st.column_config.NumberColumn("涨跌幅", format="%.2f", disabled=True),
+                "source": st.column_config.TextColumn("来源", width="small", disabled=True),
+                "user_score": st.column_config.NumberColumn("用户打分", format="%.1f", min_value=-2.0, max_value=2.0, step=0.5),
             },
             hide_index=True,
             width='stretch',
+            key="longhubang_concept_score_editor",
+            disabled=not enable_user_concept_scoring,
         )
+        if isinstance(edited_df, pd.DataFrame) and ("concept" in edited_df.columns) and ("user_score" in edited_df.columns):
+            normalized_scores = {}
+            for _, row in edited_df.iterrows():
+                concept = str(row.get("concept", "") or "").strip()
+                if not concept:
+                    continue
+                try:
+                    score = float(row.get("user_score", 0.0) or 0.0)
+                except Exception:
+                    score = 0.0
+                score = max(-2.0, min(2.0, score))
+                if abs(score) > 1e-6:
+                    normalized_scores[concept] = round(score, 2)
+            st.session_state["longhubang_user_concept_scores"] = normalized_scores
+            user_concept_scores = normalized_scores
     manual_mainline_options = [str(x.get("concept", "")).strip() for x in concept_candidates if str(x.get("concept", "")).strip()]
     manual_mainline_concepts = st.multiselect(
         "主观最强题材（最多3个）",
@@ -340,6 +380,9 @@ def display_analysis_tab():
                 mainboard_limit_up_threshold_pct=mainboard_limit_up_threshold_pct,
                 enable_manual_mainline_override=enable_manual_mainline_override,
                 manual_mainline_concepts=manual_mainline_concepts,
+                enable_user_concept_scoring=enable_user_concept_scoring,
+                user_concept_scores=user_concept_scores,
+                user_concept_score_scale=user_concept_score_scale,
             )
         else:
             run_longhubang_analysis(
@@ -353,6 +396,9 @@ def display_analysis_tab():
                 mainboard_limit_up_threshold_pct=mainboard_limit_up_threshold_pct,
                 enable_manual_mainline_override=enable_manual_mainline_override,
                 manual_mainline_concepts=manual_mainline_concepts,
+                enable_user_concept_scoring=enable_user_concept_scoring,
+                user_concept_scores=user_concept_scores,
+                user_concept_score_scale=user_concept_score_scale,
             )
     
     # 显示分析结果
@@ -382,6 +428,9 @@ def run_longhubang_analysis(
     mainboard_limit_up_threshold_pct=6.0,
     enable_manual_mainline_override=False,
     manual_mainline_concepts=None,
+    enable_user_concept_scoring=False,
+    user_concept_scores=None,
+    user_concept_score_scale=0.35,
 ):
     """运行龙虎榜分析"""
     import config
@@ -413,6 +462,9 @@ def run_longhubang_analysis(
             mainboard_limit_up_threshold_pct=float(mainboard_limit_up_threshold_pct or 6.0),
             enable_manual_mainline_override=bool(enable_manual_mainline_override),
             manual_mainline_concepts=list(manual_mainline_concepts or []),
+            enable_user_concept_scoring=bool(enable_user_concept_scoring),
+            user_concept_scores=dict(user_concept_scores or {}),
+            user_concept_score_scale=float(user_concept_score_scale or 0.35),
         )
         
         progress_bar.progress(90)
@@ -666,6 +718,16 @@ def display_scoring_ranking(result):
         st.caption(f"当前主线来源：用户主观覆盖（手动） | 生效题材：{manual_text}")
     else:
         st.caption("当前主线来源：程序自动排序（默认）")
+
+    if bool(mainline_info.get("user_score_enabled", False)):
+        effective_list = mainline_info.get("effective_user_scored_concepts", []) or []
+        effective_text = "、".join([str(x) for x in effective_list if str(x).strip()]) or "暂无"
+        st.caption(
+            f"题材打分生效：输入 {int(mainline_info.get('user_score_input_count', 0) or 0)} 项 | "
+            f"命中 {int(mainline_info.get('user_score_effective_count', 0) or 0)} 项 | "
+            f"展望命中率 {float(mainline_info.get('concept_outlook_hit_ratio', 0.0) or 0.0):.0%}"
+        )
+        st.caption(f"生效题材明细：{effective_text}")
     
     # 评分说明
     with st.expander("📖 评分维度说明", expanded=False):

@@ -117,6 +117,24 @@ def display_monitor_status():
         st.caption("基于TDX batch-quote")
         st.caption(f"当前代码池: {rr_cfg['symbols_count']} 只")
 
+    rr_status = rr_cfg.get('last_status', {}) or {}
+    status_text = (
+        f"最近轮询: {rr_status.get('last_loop_at') or 'N/A'} | "
+        f"最近载入代码数: {rr_status.get('last_symbols_load', 0)} | "
+        f"最近行情条数: {rr_status.get('last_quotes_count', 0)} | "
+        f"最近触发事件: {rr_status.get('last_event_count', 0)}"
+    )
+    st.caption(status_text)
+
+    if rr_status.get('last_skip_reason'):
+        st.warning(f"快拉跳过原因: {rr_status.get('last_skip_reason')}")
+
+    if rr_status.get('last_error'):
+        st.error(f"快拉最近错误: {rr_status.get('last_error')}")
+        if rr_status.get('last_error_trace'):
+            with st.expander("查看快拉错误堆栈", expanded=False):
+                st.code(rr_status.get('last_error_trace', ''), language='text')
+
     with st.expander("⚙️ 快拉参数配置", expanded=False):
         c1, c2, c3, c4 = st.columns(4)
         with c1:

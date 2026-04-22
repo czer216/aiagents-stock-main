@@ -17,9 +17,12 @@ services:
       # 可以在这里设置环境变量，或者使用.env文件
       - TZ=Asia/Shanghai
       - LONGHUBANG_DB_PATH=/app/data/longhubang.db
+      - TDX_ENABLED=true
+      - TDX_BASE_URL=http://tdx-stock-web:8080
     restart: unless-stopped
     networks:
       - agentsstock-network
+      - aiagents-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8503/_stcore/health"]
       interval: 30s
@@ -30,4 +33,6 @@ services:
 networks:
   agentsstock-network:
     driver: bridge
+  aiagents-net:
+    external: true
 

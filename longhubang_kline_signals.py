@@ -6,7 +6,7 @@
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -17,6 +17,14 @@ from trade_calendar_service import TradeCalendarService
 
 class SevenDayKlineTrendFetcher:
     """基于 Tushare daily 的短窗趋势阶段识别（默认9日）"""
+
+    STAGE_INDEX = {
+        "退潮期": 0.0,
+        "震荡期": 0.25,
+        "高位震荡": 0.5,
+        "启动期": 0.75,
+        "加速期": 1.0,
+    }
 
     def __init__(self):
         self.data_source_manager = data_source_manager
@@ -304,7 +312,46 @@ class SevenDayKlineTrendFetcher:
             "name": rows[-1].get("name", ""),
         }
 
-    def _normalize_codes(self, codes: List[Any]) -> List[str]:
+    def extract_stage_feature_vector(self, items: List[Dict[str, Any]]) -> Tuple[List[float], Dict[str, Any]]:
+        """
+        将区间K线明细映射为固定维度特征向量，用于相似度计算。
+        """
+        detail = self._calc_stage_detail(items)
+        if not detail:
+            return [], {}
+
+        def _clip(v: Any, lo: float, hi: float, default: float = 0.0) -> float:
+            try:
+                val = float(v)
+            except Exception:
+                val = default
+            return max(lo, min(hi, val))
+
+        stage_idx = float(self.STAGE_INDEX.get(str(detail.get("trend_stage", "")), 0.25))
+        trend_score = _clip(detail.get("trend_score", 0.0), 0.0, 1.0)
+        total_change = _clip(detail.get("change_7d_pct", 0.0) / 20.0, -1.0, 1.0)
+        latest_change = _clip(detail.get("latest_change_pct", 0.0) / 10.0, -1.0, 1.0)
+        up_streak = _clip(detail.get("up_streak", 0.0) / 6.0, 0.0, 1.0)
+        drawdown = _clip(detail.get("drawdown_from_high_pct", 0.0) / 20.0, -1.0, 0.0)
+        vol_ratio = _clip((float(detail.get("vol_ratio", 1.0) or 1.0) - 1.0) / 2.0, -1.0, 1.0)
+        upper_shadow = _clip(detail.get("latest_upper_shadow_ratio", 0.0), 0.0, 1.0)
+        body_ratio = _clip(detail.get("latest_body_ratio", 0.0), 0.0, 1.0)
+        near_high = _clip(detail.get("latest_near_high_ratio", 0.0), 0.0, 1.0)
+
+        vector = [
+            round(stage_idx, 4),
+            round(trend_score, 4),
+            round(total_change, 4),
+            round(latest_change, 4),
+            round(up_streak, 4),
+            round(drawdown, 4),
+            round(vol_ratio, 4),
+            round(upper_shadow, 4),
+            round(body_ratio, 4),
+            round(near_high, 4),
+        ]
+        return vector, detail
+
         out: List[str] = []
         seen = set()
         for item in codes:
@@ -333,6 +380,13 @@ class SevenDayKlineTrendFetcher:
     def _build_recent_trade_dates(self, days: int, end_date: Optional[str] = None) -> List[str]:
         end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
         return self.trade_calendar.recent_open_days(end8, max(int(days or 0), 1))
+
+    def build_trade_dates_by_range(self, start_date: str, end_date: str) -> List[str]:
+        start8 = self._norm_trade_date(start_date)
+        end8 = self._norm_trade_date(end_date)
+        if not start8 or not end8:
+            return []
+        return self.trade_calendar.open_days_between(start8, end8)
 
     def _find_col(self, df: pd.DataFrame, keywords: List[str]) -> str:
         for col in df.columns:
