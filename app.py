@@ -24,6 +24,7 @@ from longhubang_ui import display_longhubang
 from smart_monitor_ui import smart_monitor_ui
 from news_flow_ui import display_news_flow_monitor
 from theme_peer_ui import display_theme_peer_selector
+from theme_peer_selector import ThemePeerSelector
 
 # 页面配置
 st.set_page_config(
@@ -356,7 +357,14 @@ def main():
             if st.button("🧩 同题材补涨", width='stretch', key="nav_theme_peer", help="输入一只股票，寻找同题材低位补涨候选"):
                 st.session_state.show_theme_peer = True
                 for key in ['show_history', 'show_monitor', 'show_config', 'show_main_force',
-                           'show_sector_strategy', 'show_portfolio', 'show_smart_monitor', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_longhubang']:
+                           'show_sector_strategy', 'show_portfolio', 'show_smart_monitor', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_longhubang', 'show_kline_similarity']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+
+            if st.button("📉 同型K线", width='stretch', key="nav_kline_similarity", help="输入一只股票和时间范围，从主板检索近期同类型K线"):
+                st.session_state.show_kline_similarity = True
+                for key in ['show_history', 'show_monitor', 'show_config', 'show_main_force',
+                           'show_sector_strategy', 'show_portfolio', 'show_smart_monitor', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_longhubang', 'show_theme_peer']:
                     if key in st.session_state:
                         del st.session_state[key]
             
@@ -561,6 +569,11 @@ def main():
     # 检查是否显示同题材补涨
     if 'show_theme_peer' in st.session_state and st.session_state.show_theme_peer:
         display_theme_peer_selector()
+        return
+
+    # 检查是否显示同型K线检索
+    if 'show_kline_similarity' in st.session_state and st.session_state.show_kline_similarity:
+        _display_kline_similarity_page()
         return
 
     # 检查是否显示AI盯盘
@@ -854,6 +867,136 @@ def _infer_query_trade_date(stock_data) -> str:
         return dt.strftime("%Y-%m-%d")
     except Exception:
         return ""
+
+
+
+def _display_kline_similarity_page():
+    st.markdown(
+        """
+    <div class="top-nav">
+        <h1 class="nav-title">📉 同型K线检索</h1>
+        <p class="nav-subtitle">输入股票代码和时间范围，在主板中检索近期形态相似标的</p>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        symbol = st.text_input(
+            "目标股票代码",
+            value=st.session_state.get("kline_similarity_symbol", ""),
+            placeholder="例如 600519",
+            key="kline_similarity_symbol_page",
+        )
+    with col2:
+        min_date = datetime.strptime("2026-01-01", "%Y-%m-%d").date()
+        default_end = datetime.now().date()
+        raw_start = st.session_state.get("kline_similarity_start_date", min_date)
+        raw_end = st.session_state.get("kline_similarity_end_date", default_end)
+        start_value = raw_start if raw_start >= min_date else min_date
+        end_value = raw_end if raw_end >= min_date else min_date
+        date_range = st.date_input(
+            "时间范围",
+            value=(start_value, end_value),
+            min_value=min_date,
+            max_value=default_end,
+            key="kline_similarity_date_page",
+        )
+    with col3:
+        top_n = st.slider("返回数量", min_value=5, max_value=30, value=15, step=1, key="kline_similarity_topn_page")
+
+    run_col1, run_col2 = st.columns([1, 1])
+    with run_col1:
+        run = st.button("🚀 开始检索", type="primary", width='stretch', key="kline_similarity_run_page")
+    with run_col2:
+        clear = st.button("🧹 清空结果", width='stretch', key="kline_similarity_clear_page")
+
+    if clear:
+        st.session_state.pop("kline_similarity_result", None)
+        st.rerun()
+
+    if run:
+        if not symbol.strip():
+            st.warning("请输入目标股票代码")
+        elif not isinstance(date_range, tuple) or len(date_range) != 2:
+            st.warning("请选择开始和结束日期")
+        else:
+            start_d, end_d = date_range
+            st.session_state["kline_similarity_symbol"] = symbol.strip()
+            st.session_state["kline_similarity_start_date"] = start_d
+            st.session_state["kline_similarity_end_date"] = end_d
+            with st.spinner("正在检索主板同类型K线，请稍候..."):
+                selector = ThemePeerSelector()
+                sim_result = selector.recommend_kline_similarity(
+                    target_symbol=symbol.strip(),
+                    start_date=str(start_d),
+                    end_date=str(end_d),
+                    top_n=int(top_n),
+                )
+                st.session_state["kline_similarity_result"] = sim_result
+
+    if "kline_similarity_result" in st.session_state:
+        _render_kline_similarity_result(st.session_state.get("kline_similarity_result", {}) or {})
+
+
+def _render_kline_similarity_result(result: dict):
+    st.markdown("#### 📋 同类型K线检索结果")
+    if not result.get("success"):
+        st.warning(f"检索未成功: {result.get('error', '未知错误')}")
+        return
+
+    target_symbol = str(result.get("target_symbol", "") or "")
+    target_name = str(result.get("target_name", "") or "")
+    start_date = str(result.get("start_date", "") or "")
+    end_date = str(result.get("end_date", "") or "")
+    scanned = int(result.get("scanned", 0) or 0)
+    valid = int(result.get("valid", 0) or 0)
+    rows = list(result.get("candidates", []) or [])
+
+    st.caption(
+        f"目标: {target_symbol} {target_name} | 区间: {start_date} ~ {end_date} | 扫描: {scanned} | 有效: {valid}"
+    )
+    if result.get("compare_mode"):
+        st.caption("对比模式: 目标使用所选区间；候选使用最新同长度窗口")
+
+    sync_meta = result.get("kline_cache_sync") or {}
+    if isinstance(sync_meta, dict) and sync_meta:
+        st.caption(
+            "缓存同步: "
+            f"模式={sync_meta.get('mode', '')} | "
+            f"主板数量={sync_meta.get('symbols', 0)} | "
+            f"请求交易日={sync_meta.get('requested_trade_dates', 0)} | "
+            f"跳过交易日={sync_meta.get('skipped_trade_dates', 0)} | "
+            f"已写入={sync_meta.get('written_rows', 0)} | "
+            f"同步股票={sync_meta.get('synced_symbols', 0)} | "
+            f"失败={sync_meta.get('error_symbols', 0)}"
+        )
+
+    if not rows:
+        st.info("未找到满足条件的同类型K线候选")
+        return
+
+    table = pd.DataFrame(rows)
+    if "feature" in table.columns:
+        table = table.drop(columns=["feature"])
+    col_map = {
+        "rank": "排名",
+        "symbol": "代码",
+        "name": "名称",
+        "similarity_score": "相似度",
+        "corr_score": "特征相关",
+        "euclid_score": "特征距离",
+        "path_score": "形态路径",
+        "trend_stage": "趋势阶段",
+        "change_pct": "区间涨跌%",
+        "latest_change_pct": "最近涨跌%",
+        "vol_ratio": "量比",
+    }
+    table = table.rename(columns=col_map)
+    show_cols = [c for c in ["排名", "代码", "名称", "相似度", "形态路径", "特征相关", "特征距离", "趋势阶段", "区间涨跌%", "最近涨跌%", "量比"] if c in table.columns]
+    st.dataframe(table[show_cols], use_container_width=True, height=360)
+
 
 def parse_stock_list(stock_input):
     """解析股票代码列表

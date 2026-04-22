@@ -475,6 +475,9 @@ class LonghubangEngine:
         mainboard_limit_up_threshold_pct: float = 6.0,
         enable_manual_mainline_override: bool = False,
         manual_mainline_concepts: Optional[List[str]] = None,
+        enable_user_concept_scoring: bool = False,
+        user_concept_scores: Optional[Dict[str, float]] = None,
+        user_concept_score_scale: float = 0.35,
     ) -> Dict[str, Any]:
         """
         运行完整的龙虎榜分析流程
@@ -504,6 +507,12 @@ class LonghubangEngine:
         mainboard_limit_up_threshold = max(
             1.0, min(float(mainboard_limit_up_threshold_pct or 6.0), 10.0)
         )
+        user_score_scale = max(0.1, min(float(user_concept_score_scale or 0.35), 0.6))
+        cleaned_user_concept_scores = {
+            str(k or "").strip(): max(-2.0, min(2.0, self._safe_float_num(v)))
+            for k, v in dict(user_concept_scores or {}).items()
+            if str(k or "").strip()
+        }
         results["recommendation_quota_config"] = {
             "enabled": bool(enable_recommendation_quota),
             "recommendation_count": rec_count,
@@ -514,6 +523,11 @@ class LonghubangEngine:
             "chi_next_pct": 19.5,
             "bse_pct": 29.5,
             "st_pct": 4.8,
+        }
+        results["user_concept_scoring_config"] = {
+            "enabled": bool(enable_user_concept_scoring),
+            "scale": round(user_score_scale, 2),
+            "input_count": len(cleaned_user_concept_scores),
         }
         target_trade_date = ""
         if date:
@@ -845,8 +859,24 @@ class LonghubangEngine:
                     manual_mainline_concepts=cleaned_manual,
                 )
                 concept_candidates = self._extract_concept_strength_candidates(concept_rotation_data)
+
+            concept_outlook_map = {}
+            if bool(enable_user_concept_scoring) and cleaned_user_concept_scores:
+                concept_rotation_data = self._apply_user_concept_score_fusion(
+                    concept_rotation_data=concept_rotation_data,
+                    user_concept_scores=cleaned_user_concept_scores,
+                    score_scale=user_score_scale,
+                    concept_strength_candidates=concept_candidates,
+                )
+                concept_candidates = self._extract_concept_strength_candidates(concept_rotation_data)
+                concept_outlook_map = self._build_concept_outlook_map(
+                    concept_candidates=concept_candidates,
+                    user_concept_scores=cleaned_user_concept_scores,
+                )
+                concept_rotation_data["concept_outlook_map"] = concept_outlook_map
             results["concept_rotation"] = concept_rotation_data
             results["concept_strength_candidates"] = concept_candidates
+            results["concept_outlook_map"] = concept_outlook_map
             results["mainline_selection_info"] = {
                 "mode": "manual" if use_manual else "auto",
                 "manual_selected": cleaned_manual if use_manual else [],
@@ -855,7 +885,19 @@ class LonghubangEngine:
                 )
                 if isinstance(concept_rotation_data, dict)
                 else [],
+                "user_score_enabled": bool(enable_user_concept_scoring),
+                "user_score_input_count": len(cleaned_user_concept_scores),
+                "effective_user_scored_concepts": [
+                    c for c in (concept_rotation_data.get("user_concept_score_map", {}) or {}).keys()
+                    if str(c or "").strip()
+                ],
             }
+            effective_scored = results["mainline_selection_info"].get("effective_user_scored_concepts", []) or []
+            results["mainline_selection_info"]["user_score_effective_count"] = len(effective_scored)
+            outlook_total = len(concept_outlook_map)
+            results["mainline_selection_info"]["concept_outlook_hit_ratio"] = (
+                round(len(effective_scored) / outlook_total, 3) if outlook_total > 0 else 0.0
+            )
 
             # 补充：P1增强信号（top_list/top_inst + moneyflow_* + limit_list_*）
             p1_signal_data = self._safe_fetch_with_timeout(
@@ -983,6 +1025,7 @@ class LonghubangEngine:
                 source_completeness=source_completeness,
                 mainboard_limit_like_pct=mainboard_limit_up_threshold,
                 max_candidates=80,
+                concept_outlook_map=results.get("concept_outlook_map", {}) or {},
             )
             summary_for_ai = self._ensure_theme_clues_for_candidates(
                 summary=summary_for_ai,
@@ -1011,6 +1054,9 @@ class LonghubangEngine:
             recommendation_candidate_stocks = self._merge_history_peer_into_candidates(
                 candidate_stocks=recommendation_candidate_stocks,
                 peer_context=peer_ctx,
+            )
+            ai_candidate_stocks = self._sanitize_candidates_for_ai(
+                candidate_stocks=recommendation_candidate_stocks,
             )
             results["history_peer_rebound"] = peer_ctx
             self._log_debug_stock_trace(
@@ -1058,7 +1104,7 @@ class LonghubangEngine:
                 p1_signal_data=p1_signal_data,
                 kline_9d_data=kline_9d_data,
                 trend_overlay_scale=trend_overlay_scale,
-                fixed_candidate_stocks=recommendation_candidate_stocks,
+                fixed_candidate_stocks=ai_candidate_stocks,
             )
             agents_results["youzi"] = youzi_result
             self.logger.info(f"1/5 游资行为分析师完成 | elapsed={round(time.time() - agent_started, 2)}s")
@@ -1076,7 +1122,7 @@ class LonghubangEngine:
                 p1_signal_data=p1_signal_data,
                 kline_9d_data=kline_9d_data,
                 trend_overlay_scale=trend_overlay_scale,
-                fixed_candidate_stocks=recommendation_candidate_stocks,
+                fixed_candidate_stocks=ai_candidate_stocks,
             )
             agents_results["stock"] = stock_result
             self.logger.info(f"2/5 个股潜力分析师完成 | elapsed={round(time.time() - agent_started, 2)}s")
@@ -1094,7 +1140,7 @@ class LonghubangEngine:
                 p1_signal_data=p1_signal_data,
                 kline_9d_data=kline_9d_data,
                 trend_overlay_scale=trend_overlay_scale,
-                fixed_candidate_stocks=recommendation_candidate_stocks,
+                fixed_candidate_stocks=ai_candidate_stocks,
             )
             agents_results["theme"] = theme_result
             self.logger.info(f"3/5 题材追踪分析师完成 | elapsed={round(time.time() - agent_started, 2)}s")
@@ -1112,7 +1158,7 @@ class LonghubangEngine:
                 p1_signal_data=p1_signal_data,
                 kline_9d_data=kline_9d_data,
                 trend_overlay_scale=trend_overlay_scale,
-                fixed_candidate_stocks=recommendation_candidate_stocks,
+                fixed_candidate_stocks=ai_candidate_stocks,
             )
             agents_results["risk"] = risk_result
             self.logger.info(f"4/5 风险控制专家完成 | elapsed={round(time.time() - agent_started, 2)}s")
@@ -2624,6 +2670,126 @@ class LonghubangEngine:
             )
         return rows
 
+    def _apply_user_concept_score_fusion(
+        self,
+        concept_rotation_data: Dict[str, Any],
+        user_concept_scores: Dict[str, float],
+        score_scale: float = 0.35,
+        concept_strength_candidates: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        if not isinstance(concept_rotation_data, dict):
+            return concept_rotation_data
+        base_map = dict(concept_rotation_data.get("concept_strength_map", {}) or {})
+        if not base_map:
+            return concept_rotation_data
+
+        normalized_input = {
+            self._normalize_theme_match_key(k): max(-2.0, min(2.0, self._safe_float_num(v)))
+            for k, v in dict(user_concept_scores or {}).items()
+            if self._normalize_theme_match_key(k)
+        }
+        if not normalized_input:
+            return concept_rotation_data
+
+        scale = max(0.1, min(float(score_scale or 0.35), 0.6))
+        fused_map = dict(base_map)
+        effective_scores: Dict[str, float] = {}
+
+        base_key_map: Dict[str, str] = {}
+        for concept in base_map.keys():
+            key = self._normalize_theme_match_key(concept)
+            if key:
+                base_key_map[key] = concept
+
+        candidate_rows = list(concept_strength_candidates or [])
+        candidate_key_map: Dict[str, Dict[str, Any]] = {}
+        for row in candidate_rows:
+            concept = str((row or {}).get("concept", "") or "").strip()
+            key = self._normalize_theme_match_key(concept)
+            if key:
+                candidate_key_map[key] = {
+                    "concept": concept,
+                    "strength_100": float((row or {}).get("strength_100", 0.0) or 0.0),
+                }
+
+        max_base = max([float(v or 0.0) for v in base_map.values()] or [1.0])
+        min_base = min([float(v or 0.0) for v in base_map.values()] or [0.1])
+
+        for key, user_score in normalized_input.items():
+            concept = base_key_map.get(key)
+            base_val = None
+            if concept:
+                base_val = float(base_map.get(concept, 0.0) or 0.0)
+            else:
+                candidate_meta = candidate_key_map.get(key) or {}
+                concept = str(candidate_meta.get("concept", "") or "").strip()
+                if concept:
+                    s100 = max(0.0, min(100.0, float(candidate_meta.get("strength_100", 0.0) or 0.0)))
+                    mapped = max_base * (s100 / 100.0)
+                    base_val = max(min_base, mapped)
+            if not concept or base_val is None:
+                continue
+
+            u = user_score / 2.0
+            adj = max(-0.35, min(0.35, scale * u))
+            fused_map[concept] = round(float(base_val) * (1.0 + adj), 3)
+            effective_scores[concept] = round(user_score, 2)
+
+        out = dict(concept_rotation_data)
+        out["concept_strength_map_base"] = base_map
+        out["concept_strength_map"] = fused_map
+        out["user_concept_score_map"] = effective_scores
+        return out
+
+    def _build_concept_outlook_map(
+        self,
+        concept_candidates: List[Dict[str, Any]],
+        user_concept_scores: Dict[str, float],
+    ) -> Dict[str, Dict[str, Any]]:
+        rows = list(concept_candidates or [])
+        if not rows:
+            return {}
+
+        normalized_input = {
+            self._normalize_theme_match_key(k): max(-2.0, min(2.0, self._safe_float_num(v)))
+            for k, v in dict(user_concept_scores or {}).items()
+            if self._normalize_theme_match_key(k)
+        }
+        if not normalized_input:
+            return {}
+
+        counts = [int(x.get("count", 0) or 0) for x in rows]
+        sorted_counts = sorted(counts)
+        median_count = sorted_counts[len(sorted_counts) // 2] if sorted_counts else 0
+        median_base = max(int(median_count or 0), 1)
+
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            concept = str(row.get("concept", "") or "").strip()
+            if not concept:
+                continue
+            key = self._normalize_theme_match_key(concept)
+            if key not in normalized_input:
+                continue
+            u = normalized_input[key] / 2.0
+            s1 = max(0.0, min(1.0, float(row.get("strength_100", 0.0) or 0.0) / 100.0))
+            s2 = max(-1.0, min(1.0, float(row.get("pct_chg", 0.0) or 0.0) / 6.0))
+            cnt = int(row.get("count", 0) or 0)
+            s3 = max(-1.0, min(1.0, (cnt - median_base) / float(median_base)))
+            score = 0.5 * s1 + 0.2 * s2 + 0.1 * s3 + 0.2 * u
+            if score >= 0.35:
+                outlook = "next_day_strong"
+            elif score <= -0.20:
+                outlook = "divergence_pullback"
+            else:
+                outlook = "neutral"
+            out[concept] = {
+                "outlook": outlook,
+                "score": round(score, 3),
+                "user_score": round(normalized_input[key], 2),
+            }
+        return out
+
     def _apply_manual_mainline_override(
         self,
         concept_rotation_data: Dict[str, Any],
@@ -3271,6 +3437,34 @@ class LonghubangEngine:
             }
         return out
 
+    def _sanitize_candidates_for_ai(
+        self,
+        candidate_stocks: Optional[List[Dict[str, Any]]],
+    ) -> List[Dict[str, Any]]:
+        """
+        AI候选字段白名单：补涨peer字段仅用于展示，不进入AI决策上下文。
+        """
+        allowed_keys = {
+            "code", "name", "net_inflow", "pct_chg",
+            "is_today_limit_up", "is_limit_like_for_quota",
+            "limit_quality_score", "p1_score", "theme_tokens",
+            "concept_user_bias", "concept_outlook_tag", "concept_outlook_hits",
+            "kline_trend_stage", "kline_change_7d_pct", "kline_latest_change_pct",
+            "kline_drawdown_from_high_pct", "kline_vol_ratio",
+            "data_completeness", "signal_consistency", "data_quality_grade",
+        }
+        out: List[Dict[str, Any]] = []
+        for row in (candidate_stocks or []):
+            item = dict(row or {})
+            code = self._normalize_code(item.get("code", ""))
+            if not code:
+                continue
+            clean = {k: item.get(k) for k in allowed_keys if k in item}
+            clean["code"] = code
+            clean["name"] = str(item.get("name", "") or "")
+            out.append(clean)
+        return out
+
     def _build_chief_candidate_quota_context(
         self,
         summary: Dict[str, Any],
@@ -3387,6 +3581,7 @@ class LonghubangEngine:
         source_completeness: Optional[Dict[str, bool]] = None,
         mainboard_limit_like_pct: float = 6.0,
         max_candidates: int = 80,
+        concept_outlook_map: Optional[Dict[str, Dict[str, Any]]] = None,
     ) -> List[Dict[str, Any]]:
         """
         构建“推荐候选股票池”：
@@ -3401,6 +3596,36 @@ class LonghubangEngine:
         trend_map = (kline_9d_data or {}).get("stock_trend_map", {}) or {}
         clue_map = self._build_theme_clue_map_from_summary(summary_for_ai or summary or {})
         source_ready = dict(source_completeness or {})
+        outlook_map_raw = dict(concept_outlook_map or {})
+        outlook_map = {
+            self._normalize_theme_match_key(k): dict(v or {})
+            for k, v in outlook_map_raw.items()
+            if self._normalize_theme_match_key(k)
+        }
+
+        def _calc_concept_bias(theme_tokens: List[str]) -> Dict[str, Any]:
+            if not theme_tokens or not outlook_map:
+                return {"bias": 0.0, "tag": "neutral", "hits": []}
+            hits = []
+            total = 0.0
+            for token in theme_tokens:
+                key = self._normalize_theme_match_key(token)
+                meta = outlook_map.get(key)
+                if not meta:
+                    continue
+                score = float(meta.get("score", 0.0) or 0.0)
+                total += score
+                hits.append((token, str(meta.get("outlook", "neutral") or "neutral"), score))
+            if not hits:
+                return {"bias": 0.0, "tag": "neutral", "hits": []}
+            bias = total / len(hits)
+            if bias >= 0.2:
+                tag = "next_day_strong"
+            elif bias <= -0.12:
+                tag = "divergence_pullback"
+            else:
+                tag = "neutral"
+            return {"bias": round(bias, 3), "tag": tag, "hits": hits}
 
         def _build_candidate_row(code: str, name: str, net_inflow: float) -> Dict[str, Any]:
             p1 = p1_map.get(code, {}) or {}
@@ -3417,6 +3642,7 @@ class LonghubangEngine:
             p1_score = round(float(p1.get("score", 0.0) or 0.0), 3)
             limit_quality_score = round(float(p1.get("limit_quality_score", 0.0) or 0.0), 3)
             theme_tokens = (clue_map.get(code, []) or [])[:6]
+            concept_bias_meta = _calc_concept_bias(theme_tokens)
             quality = self._calc_candidate_data_quality(
                 net_inflow=float(net_inflow or 0.0),
                 pct_chg=pct,
@@ -3436,6 +3662,12 @@ class LonghubangEngine:
                 "limit_quality_score": limit_quality_score,
                 "p1_score": p1_score,
                 "theme_tokens": "、".join(theme_tokens),
+                "concept_user_bias": float(concept_bias_meta.get("bias", 0.0) or 0.0),
+                "concept_outlook_tag": str(concept_bias_meta.get("tag", "neutral") or "neutral"),
+                "concept_outlook_hits": [
+                    {"theme": h[0], "outlook": h[1], "score": round(float(h[2] or 0.0), 3)}
+                    for h in (concept_bias_meta.get("hits", []) or [])
+                ],
                 "kline_trend_stage": trend_stage,
                 "kline_change_7d_pct": round(float(trend.get("change_7d_pct", 0.0) or 0.0), 2),
                 "kline_latest_change_pct": round(float(trend.get("latest_change_pct", 0.0) or 0.0), 2),
@@ -3457,9 +3689,11 @@ class LonghubangEngine:
                 net_inflow=float(row.get("净流入", 0.0) or row.get("net_inflow", 0.0) or 0.0),
             ))
             if len(out) >= cap:
-                return out
+                break
 
         for row in (summary.get("top_stocks", []) or []):
+            if len(out) >= cap:
+                break
             code = self._normalize_code(row.get("code", ""))
             if not code or code in seen or not self._is_mainboard_code(code):
                 continue
@@ -3471,6 +3705,24 @@ class LonghubangEngine:
             ))
             if len(out) >= cap:
                 break
+
+        if outlook_map:
+            hit_count = sum(1 for x in out if abs(float(x.get("concept_user_bias", 0.0) or 0.0)) > 1e-9)
+            self.logger.info(
+                "[候选池] 概念展望排序执行 | candidates=%s | outlook_map=%s | bias_hit=%s",
+                len(out),
+                len(outlook_map),
+                hit_count,
+            )
+            out.sort(
+                key=lambda x: (
+                    float(x.get("concept_user_bias", 0.0) or 0.0),
+                    float(x.get("p1_score", 0.0) or 0.0),
+                    float(x.get("limit_quality_score", 0.0) or 0.0),
+                    float(x.get("net_inflow", 0.0) or 0.0),
+                ),
+                reverse=True,
+            )
         return out
 
     def _extract_active_themes_for_history_peer(
@@ -3773,8 +4025,11 @@ class LonghubangEngine:
                 if code in excluded:
                     # 跌停池股票不参与推荐
                     continue
-                is_limit_up_real = self._is_today_limit_up(code, p1_signal_data)
                 pct_chg = pct_map.get(code, None)
+                if pct_chg is not None and float(pct_chg) <= -9.5:
+                    # 兜底：跌停/近跌停直接剔除
+                    continue
+                is_limit_up_real = self._is_today_limit_up(code, p1_signal_data)
                 is_limit_like_for_quota = self._is_limit_like_for_quota(
                     code=code,
                     name=stock.get("name", ""),
@@ -4355,7 +4610,7 @@ class LonghubangEngine:
                 or ("跌停池" in sblx)
                 or ("跌停" in status and "涨停" not in status)
             )
-            if is_drop_pool and ("limit_list_ths" in source or "同花顺涨停池" in sblx):
+            if is_drop_pool:
                 out.add(code)
         return out
     

@@ -12,12 +12,15 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 import re
 import json
+import math
+import os
+import sqlite3
 
 import pandas as pd
 
 from data_source_manager import data_source_manager
 from tushare_proxy_rate_limit import call_tushare_with_timeout
-from deepseek_client import DeepSeekClient
+from longhubang_kline_signals import SevenDayKlineTrendFetcher
 
 
 @dataclass
@@ -63,7 +66,11 @@ class ThemePeerSelector:
     def __init__(self):
         self.pro = data_source_manager.tushare_api if data_source_manager.tushare_available else None
         self._stock_basic_cache: Optional[pd.DataFrame] = None
-        self._ai_client: Optional[DeepSeekClient] = None
+        self._ai_client = None
+        self._trend_fetcher = SevenDayKlineTrendFetcher()
+        self._last_cache_error = ""
+        self.kline_db_path = self._resolve_kline_db_path()
+        self._ensure_kline_cache_table()
 
     def recommend(
         self,
@@ -154,6 +161,663 @@ class ThemePeerSelector:
         out["candidates"] = [self._candidate_to_dict(x) for x in ranked]
         return out
 
+    def recommend_kline_similarity(
+        self,
+        target_symbol: str,
+        start_date: str,
+        end_date: str,
+        top_n: int = 20,
+        max_candidates: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "success": False,
+            "target_symbol": self._normalize_symbol(target_symbol),
+            "target_name": "",
+            "start_date": "",
+            "end_date": "",
+            "feature_method": "vec(0.5)+path(0.5)",
+            "candidate_universe": 0,
+            "scanned": 0,
+            "valid": 0,
+            "candidates": [],
+            "error": "",
+        }
+
+        symbol = out["target_symbol"]
+        if not symbol:
+            out["error"] = "请输入6位A股代码"
+            return out
+
+        start_dt = self._parse_date_flexible(start_date)
+        end_dt = self._parse_date_flexible(end_date)
+        if start_dt is None or end_dt is None:
+            out["error"] = "请选择有效的时间范围"
+            return out
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        cache_floor = datetime.strptime("2026-01-01", "%Y-%m-%d")
+        if end_dt < cache_floor:
+            out["error"] = "当前缓存仅含2026年数据，请选择2026-01-01之后的时间范围"
+            return out
+        if start_dt < cache_floor:
+            start_dt = cache_floor
+
+        out["start_date"] = start_dt.strftime("%Y-%m-%d")
+        out["end_date"] = end_dt.strftime("%Y-%m-%d")
+
+        end8 = end_dt.strftime("%Y%m%d")
+        last_sync = self._get_sync_meta("mainboard_last_sync_date")
+        need_sync = (not last_sync) or (last_sync < end8)
+        if need_sync:
+            sync_meta = self.sync_mainboard_kline_cache(
+                start_date="2026-01-01",
+                end_date=out["end_date"],
+                full_refresh=False,
+            )
+        else:
+            sync_meta = {
+                "success": True,
+                "mode": "skip_up_to_date",
+                "db_path": self.kline_db_path,
+                "last_sync": last_sync,
+                "requested_trade_dates": 0,
+                "skipped_trade_dates": 0,
+                "written_rows": 0,
+                "synced_symbols": 0,
+                "error_symbols": 0,
+                "symbols": 0,
+            }
+        out["kline_cache_sync"] = sync_meta
+
+        stock_map = self._get_stock_name_map()
+        out["target_name"] = stock_map.get(symbol, "")
+
+        target_df = self._load_kline_from_cache(
+            symbol=symbol,
+            start_date=out["start_date"],
+            end_date=out["end_date"],
+        )
+        if target_df is None or target_df.empty:
+            if self._last_cache_error:
+                out["error"] = f"读取K线缓存失败: {self._last_cache_error}"
+            else:
+                out["error"] = "目标股票在所选区间无有效K线数据"
+            return out
+
+        target_vector, target_detail = self._extract_feature_from_kline(target_df)
+        if not target_vector:
+            bars = int(len(target_df.index)) if hasattr(target_df, "index") else 0
+            out["error"] = f"目标股票区间交易日不足，当前{bars}根，至少需要5根"
+            return out
+
+        out["target_feature"] = target_detail
+        out["compare_mode"] = "target_range_vs_candidate_latest_window"
+
+        target_bars = int(len(target_df.index)) if hasattr(target_df, "index") else 0
+        latest_trade_date = self._get_cache_latest_trade_date()
+
+        universe = self._build_mainboard_universe(limit=max_candidates)
+        if symbol in universe:
+            universe.remove(symbol)
+        out["candidate_universe"] = len(universe)
+        if not universe:
+            out["error"] = "主板候选池为空"
+            return out
+
+        ranked: List[Dict[str, Any]] = []
+        for cand_symbol in universe:
+            out["scanned"] += 1
+            if latest_trade_date:
+                cand_df = self._load_latest_window_from_cache(
+                    symbol=cand_symbol,
+                    bars=target_bars,
+                    end_trade_date=latest_trade_date,
+                )
+            else:
+                cand_df = self._load_latest_window_from_cache(symbol=cand_symbol, bars=target_bars)
+            if cand_df is None or cand_df.empty:
+                continue
+            cand_vector, cand_detail = self._extract_feature_from_kline(cand_df)
+            if not cand_vector:
+                continue
+            sim_score_vec, corr_score, euclid_score = self._calc_similarity_score(target_vector, cand_vector)
+            path_score = self._calc_path_similarity(target_df, cand_df)
+            sim_score = 0.5 * sim_score_vec + 0.5 * path_score
+            if sim_score <= 0:
+                continue
+            out["valid"] += 1
+            ranked.append(
+                {
+                    "symbol": cand_symbol,
+                    "name": stock_map.get(cand_symbol, ""),
+                    "similarity_score": round(sim_score, 4),
+                    "corr_score": round(corr_score, 4),
+                    "euclid_score": round(euclid_score, 4),
+                    "path_score": round(path_score, 4),
+                    "trend_stage": str(cand_detail.get("trend_stage", "") or ""),
+                    "change_pct": round(float(cand_detail.get("change_7d_pct", 0.0) or 0.0), 2),
+                    "latest_change_pct": round(float(cand_detail.get("latest_change_pct", 0.0) or 0.0), 2),
+                    "vol_ratio": round(float(cand_detail.get("vol_ratio", 0.0) or 0.0), 2),
+                    "feature": cand_detail,
+                    "candidate_window_end": cand_detail.get("latest_trade_date", ""),
+                    "candidate_window_bars": int(len(cand_df.index)) if hasattr(cand_df, "index") else 0,
+                }
+            )
+
+        ranked.sort(
+            key=lambda x: (
+                float(x.get("similarity_score", 0.0) or 0.0),
+                float(x.get("corr_score", 0.0) or 0.0),
+                -abs(float(x.get("change_pct", 0.0) or 0.0)),
+            ),
+            reverse=True,
+        )
+
+        top_rows = ranked[:max(1, int(top_n or 20))]
+        for idx, row in enumerate(top_rows, 1):
+            row["rank"] = idx
+
+        out["success"] = True
+        out["candidates"] = top_rows
+        if not top_rows:
+            out["error"] = "候选股票数据不足，未形成有效相似结果"
+        return out
+
+    def _resolve_kline_db_path(self) -> str:
+        base_dir = os.path.dirname(__file__)
+        candidates = [
+            os.path.join(base_dir, "data", "kline_cache_2026.db"),
+            os.path.join(os.getcwd(), "data", "kline_cache_2026.db"),
+            "/tmp/kline_cache_2026.db",
+        ]
+        for path in candidates:
+            try:
+                parent = os.path.dirname(path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with sqlite3.connect(path) as conn:
+                    conn.execute("SELECT 1")
+                return path
+            except Exception:
+                continue
+        return candidates[-1]
+
+    def _ensure_kline_cache_table(self):
+        db_dir = os.path.dirname(self.kline_db_path)
+        os.makedirs(db_dir, exist_ok=True)
+        with sqlite3.connect(self.kline_db_path, timeout=15) as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kline_daily (
+                    symbol TEXT NOT NULL,
+                    trade_date TEXT NOT NULL,
+                    open REAL,
+                    high REAL,
+                    low REAL,
+                    close REAL,
+                    vol REAL,
+                    amount REAL,
+                    pct_chg REAL,
+                    source TEXT,
+                    updated_at TEXT,
+                    PRIMARY KEY (symbol, trade_date)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS kline_sync_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    updated_at TEXT
+                )
+                """
+            )
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kline_daily_date ON kline_daily(trade_date)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_kline_daily_symbol ON kline_daily(symbol)")
+            conn.commit()
+
+    def _get_sync_meta(self, key: str) -> str:
+        with sqlite3.connect(self.kline_db_path) as conn:
+            row = conn.execute("SELECT value FROM kline_sync_meta WHERE key = ?", (key,)).fetchone()
+            return str(row[0]) if row and row[0] is not None else ""
+
+    def _set_sync_meta(self, key: str, value: str):
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with sqlite3.connect(self.kline_db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO kline_sync_meta(key, value, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value=excluded.value,
+                    updated_at=excluded.updated_at
+                """,
+                (key, value, now_text),
+            )
+            conn.commit()
+
+    def _get_symbol_max_trade_date(self, symbol: str) -> str:
+        symbol = self._normalize_symbol(symbol)
+        if not symbol:
+            return ""
+        with sqlite3.connect(self.kline_db_path) as conn:
+            row = conn.execute(
+                "SELECT MAX(trade_date) FROM kline_daily WHERE symbol = ?",
+                (symbol,),
+            ).fetchone()
+        if not row or row[0] is None:
+            return ""
+        text = str(row[0]).strip()
+        return text if re.fullmatch(r"\d{8}", text) else ""
+
+    def _upsert_kline_rows(self, symbol: str, df: pd.DataFrame, source: str = "tushare") -> int:
+        if df is None or df.empty:
+            return 0
+
+        rows: List[Tuple[Any, ...]] = []
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for _, row in df.iterrows():
+            trade_date = str(row.get("trade_date") or "").strip()
+            if not trade_date:
+                continue
+            trade_date = trade_date.replace("-", "")
+            if not re.fullmatch(r"\d{8}", trade_date):
+                continue
+
+            def _num(v: Any) -> float:
+                try:
+                    if v is None or str(v).strip() == "":
+                        return 0.0
+                    return float(v)
+                except Exception:
+                    return 0.0
+
+            rows.append(
+                (
+                    symbol,
+                    trade_date,
+                    _num(row.get("open")),
+                    _num(row.get("high")),
+                    _num(row.get("low")),
+                    _num(row.get("close")),
+                    _num(row.get("vol")),
+                    _num(row.get("amount")),
+                    _num(row.get("pct_chg")),
+                    source,
+                    now_text,
+                )
+            )
+
+        if not rows:
+            return 0
+
+        with sqlite3.connect(self.kline_db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO kline_daily(
+                    symbol, trade_date, open, high, low, close, vol, amount, pct_chg, source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                    open=excluded.open,
+                    high=excluded.high,
+                    low=excluded.low,
+                    close=excluded.close,
+                    vol=excluded.vol,
+                    amount=excluded.amount,
+                    pct_chg=excluded.pct_chg,
+                    source=excluded.source,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+            conn.commit()
+        return len(rows)
+
+    def _fetch_tushare_kline(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        if not self.pro or not hasattr(self.pro, "daily"):
+            return pd.DataFrame()
+        ts_code = self._to_ts_code(symbol)
+        if not ts_code:
+            return pd.DataFrame()
+        try:
+            df = call_tushare_with_timeout(
+                api_callable=lambda: self.pro.daily(ts_code=ts_code, start_date=start_date, end_date=end_date),
+                timeout_sec=30,
+                api_name="daily",
+            )
+        except Exception:
+            return pd.DataFrame()
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        if "trade_date" in df.columns:
+            df = df.sort_values("trade_date").reset_index(drop=True)
+        return df
+
+    def _is_trade_date_cached(self, trade_date: str, min_rows: int = 100) -> bool:
+        text = str(trade_date or "").strip().replace("-", "")
+        if not re.fullmatch(r"\d{8}", text):
+            return False
+        with sqlite3.connect(self.kline_db_path) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM kline_daily WHERE trade_date = ?",
+                (text,),
+            ).fetchone()
+        count = int(row[0]) if row and row[0] is not None else 0
+        return count >= max(1, int(min_rows or 1))
+
+    def _fetch_tushare_daily_snapshot(self, trade_date: str) -> pd.DataFrame:
+        if not self.pro or not hasattr(self.pro, "daily"):
+            return pd.DataFrame()
+        try:
+            df = call_tushare_with_timeout(
+                api_callable=lambda: self.pro.daily(trade_date=trade_date),
+                timeout_sec=45,
+                api_name="daily",
+            )
+        except Exception:
+            return pd.DataFrame()
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return pd.DataFrame()
+        return df
+
+    def _upsert_daily_snapshot_rows(self, trade_date: str, df: pd.DataFrame, symbol_set: Optional[set] = None) -> int:
+        if df is None or df.empty:
+            return 0
+
+        code_col = self._find_col(df, ["ts_code", "code", "symbol", "con_code"])
+        if not code_col:
+            return 0
+
+        now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows: List[Tuple[Any, ...]] = []
+
+        def _num(v: Any) -> float:
+            try:
+                if v is None or str(v).strip() == "":
+                    return 0.0
+                return float(v)
+            except Exception:
+                return 0.0
+
+        for _, row in df.iterrows():
+            symbol = self._normalize_symbol(row.get(code_col))
+            if not symbol:
+                continue
+            if symbol.startswith(("300", "688", "8", "4")):
+                continue
+            if symbol_set is not None and symbol not in symbol_set:
+                continue
+            close_v = _num(row.get("close"))
+            if close_v <= 0:
+                continue
+            rows.append(
+                (
+                    symbol,
+                    trade_date,
+                    _num(row.get("open")),
+                    _num(row.get("high")),
+                    _num(row.get("low")),
+                    close_v,
+                    _num(row.get("vol")),
+                    _num(row.get("amount")),
+                    _num(row.get("pct_chg")),
+                    "tushare.daily_snapshot",
+                    now_text,
+                )
+            )
+
+        if not rows:
+            return 0
+
+        with sqlite3.connect(self.kline_db_path) as conn:
+            conn.executemany(
+                """
+                INSERT INTO kline_daily(
+                    symbol, trade_date, open, high, low, close, vol, amount, pct_chg, source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol, trade_date) DO UPDATE SET
+                    open=excluded.open,
+                    high=excluded.high,
+                    low=excluded.low,
+                    close=excluded.close,
+                    vol=excluded.vol,
+                    amount=excluded.amount,
+                    pct_chg=excluded.pct_chg,
+                    source=excluded.source,
+                    updated_at=excluded.updated_at
+                """,
+                rows,
+            )
+            conn.commit()
+        return len(rows)
+
+    def _select_sync_symbols(self) -> List[str]:
+        stock_map = self._get_stock_name_map()
+        out: List[str] = []
+        for symbol in stock_map.keys():
+            if not symbol:
+                continue
+            if self._is_filtered_market(symbol):
+                continue
+            if symbol.startswith(("8", "4")):
+                continue
+            out.append(symbol)
+        return sorted(set(out))
+
+    def sync_mainboard_kline_cache(
+        self,
+        start_date: str = "2026-01-01",
+        end_date: Optional[str] = None,
+        full_refresh: bool = False,
+    ) -> Dict[str, Any]:
+        end_dt = self._parse_date_flexible(end_date or datetime.now().strftime("%Y-%m-%d"))
+        start_dt = self._parse_date_flexible(start_date)
+        if end_dt is None:
+            end_dt = datetime.now()
+        if start_dt is None:
+            start_dt = datetime.strptime("2026-01-01", "%Y-%m-%d")
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        symbols = self._select_sync_symbols()
+        symbol_set = set(symbols) if symbols else None
+        tracked_symbols = len(symbol_set) if symbol_set is not None else 0
+        meta = {
+            "success": True,
+            "db_path": self.kline_db_path,
+            "symbols": tracked_symbols,
+            "range_start": start_dt.strftime("%Y-%m-%d"),
+            "range_end": end_dt.strftime("%Y-%m-%d"),
+            "mode": "trade_date_snapshot",
+            "written_rows": 0,
+            "synced_symbols": 0,
+            "error_symbols": 0,
+            "requested_trade_dates": 0,
+            "skipped_trade_dates": 0,
+        }
+        if symbol_set is None:
+            meta["symbols"] = -1
+
+        start8 = start_dt.strftime("%Y%m%d")
+        end8 = end_dt.strftime("%Y%m%d")
+
+        if not full_refresh:
+            last_sync = self._get_sync_meta("mainboard_last_sync_date")
+            if last_sync and re.fullmatch(r"\d{8}", last_sync):
+                try:
+                    next_dt = datetime.strptime(last_sync, "%Y%m%d") + timedelta(days=1)
+                    start8 = max(start8, next_dt.strftime("%Y%m%d"))
+                except Exception:
+                    pass
+
+        if start8 > end8:
+            meta["mode"] = "noop"
+            meta["last_sync"] = self._get_sync_meta("mainboard_last_sync_date")
+            return meta
+
+        try:
+            trade_dates = self._trend_fetcher.build_trade_dates_by_range(start8, end8)
+        except Exception:
+            trade_dates = []
+            cur_dt = datetime.strptime(start8, "%Y%m%d")
+            end_dt2 = datetime.strptime(end8, "%Y%m%d")
+            while cur_dt <= end_dt2:
+                trade_dates.append(cur_dt.strftime("%Y%m%d"))
+                cur_dt += timedelta(days=1)
+        if not trade_dates:
+            meta["success"] = False
+            meta["error"] = "无可同步交易日"
+            return meta
+
+        synced_symbols: set = set()
+        for trade_date in trade_dates:
+            already = self._is_trade_date_cached(trade_date, min_rows=max(50, len(symbol_set) // 4))
+            if already and not full_refresh:
+                meta["skipped_trade_dates"] += 1
+                continue
+
+            meta["requested_trade_dates"] += 1
+            day_df = self._fetch_tushare_daily_snapshot(trade_date)
+            if day_df is None or day_df.empty:
+                meta["error_symbols"] += 1
+                continue
+            try:
+                written = self._upsert_daily_snapshot_rows(trade_date, day_df, symbol_set)
+                meta["written_rows"] += int(written)
+                if written > 0:
+                    code_col = self._find_col(day_df, ["ts_code", "code", "symbol", "con_code"])
+                    if code_col:
+                        for _, row in day_df.iterrows():
+                            s = self._normalize_symbol(row.get(code_col))
+                            if s and s in symbol_set:
+                                synced_symbols.add(s)
+            except Exception:
+                meta["error_symbols"] += 1
+
+        meta["synced_symbols"] = len(synced_symbols)
+        self._set_sync_meta("mainboard_last_sync_date", end8)
+        self._set_sync_meta("mainboard_sync_updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        meta["last_sync"] = end8
+        return meta
+
+    def _get_cache_latest_trade_date(self) -> str:
+        try:
+            with sqlite3.connect(self.kline_db_path, timeout=15) as conn:
+                row = conn.execute("SELECT MAX(trade_date) FROM kline_daily").fetchone()
+            if not row or row[0] is None:
+                return ""
+            text = str(row[0]).strip()
+            return text if re.fullmatch(r"\d{8}", text) else ""
+        except Exception:
+            return ""
+
+    def _load_latest_window_from_cache(
+        self,
+        symbol: str,
+        bars: int,
+        end_trade_date: Optional[str] = None,
+    ) -> pd.DataFrame:
+        symbol = self._normalize_symbol(symbol)
+        if not symbol:
+            return pd.DataFrame()
+        bars_n = max(6, int(bars or 0))
+        self._last_cache_error = ""
+        end8 = ""
+        if end_trade_date:
+            text = str(end_trade_date).strip().replace("-", "")
+            if re.fullmatch(r"\d{8}", text):
+                end8 = text
+
+        try:
+            with sqlite3.connect(self.kline_db_path, timeout=15) as conn:
+                conn.execute("PRAGMA query_only=ON")
+                if end8:
+                    query = """
+                    SELECT trade_date, open, high, low, close, vol
+                    FROM kline_daily
+                    WHERE symbol = ? AND trade_date <= ?
+                    ORDER BY trade_date DESC
+                    LIMIT ?
+                    """
+                    df = pd.read_sql_query(query, conn, params=(symbol, end8, bars_n))
+                else:
+                    query = """
+                    SELECT trade_date, open, high, low, close, vol
+                    FROM kline_daily
+                    WHERE symbol = ?
+                    ORDER BY trade_date DESC
+                    LIMIT ?
+                    """
+                    df = pd.read_sql_query(query, conn, params=(symbol, bars_n))
+        except Exception as exc:
+            self._last_cache_error = str(exc)
+            return pd.DataFrame()
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df = df.sort_values("trade_date").reset_index(drop=True)
+        out = pd.DataFrame(
+            {
+                "日期": pd.to_datetime(df["trade_date"], format="%Y%m%d", errors="coerce"),
+                "开盘": pd.to_numeric(df["open"], errors="coerce"),
+                "最高": pd.to_numeric(df["high"], errors="coerce"),
+                "最低": pd.to_numeric(df["low"], errors="coerce"),
+                "收盘": pd.to_numeric(df["close"], errors="coerce"),
+                "成交量": pd.to_numeric(df["vol"], errors="coerce"),
+            }
+        )
+        out = out.dropna(subset=["日期", "收盘"]).reset_index(drop=True)
+        return out
+
+    def _load_kline_from_cache(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
+        symbol = self._normalize_symbol(symbol)
+        if not symbol:
+            return pd.DataFrame()
+        start_dt = self._parse_date_flexible(start_date)
+        end_dt = self._parse_date_flexible(end_date)
+        if start_dt is None or end_dt is None:
+            return pd.DataFrame()
+        if start_dt > end_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        start8 = start_dt.strftime("%Y%m%d")
+        end8 = end_dt.strftime("%Y%m%d")
+        self._last_cache_error = ""
+        try:
+            with sqlite3.connect(self.kline_db_path, timeout=15) as conn:
+                conn.execute("PRAGMA query_only=ON")
+                query = """
+                SELECT trade_date, open, high, low, close, vol
+                FROM kline_daily
+                WHERE symbol = ? AND trade_date >= ? AND trade_date <= ?
+                ORDER BY trade_date ASC
+                """
+                df = pd.read_sql_query(query, conn, params=(symbol, start8, end8))
+        except Exception as exc:
+            self._last_cache_error = str(exc)
+            return pd.DataFrame()
+
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        out = pd.DataFrame(
+            {
+                "日期": pd.to_datetime(df["trade_date"], format="%Y%m%d", errors="coerce"),
+                "开盘": pd.to_numeric(df["open"], errors="coerce"),
+                "最高": pd.to_numeric(df["high"], errors="coerce"),
+                "最低": pd.to_numeric(df["low"], errors="coerce"),
+                "收盘": pd.to_numeric(df["close"], errors="coerce"),
+                "成交量": pd.to_numeric(df["vol"], errors="coerce"),
+            }
+        )
+        out = out.dropna(subset=["日期", "收盘"]).reset_index(drop=True)
+        return out
+
     def _candidate_to_dict(self, item: PeerCandidate) -> Dict[str, Any]:
         return {
             "symbol": item.symbol,
@@ -174,6 +838,148 @@ class ThemePeerSelector:
             "ai_reason": item.ai_reason,
             "reason": item.reason,
         }
+
+    def _extract_feature_from_kline(self, df: pd.DataFrame) -> Tuple[List[float], Dict[str, Any]]:
+        if df is None or df.empty:
+            return [], {}
+        rows: List[Dict[str, Any]] = []
+        data = df.copy()
+        rename_map = {
+            "日期": "trade_date",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交量": "vol",
+        }
+        data = data.rename(columns=rename_map)
+        for _, row in data.iterrows():
+            try:
+                close_v = float(row.get("close", 0.0) or 0.0)
+            except Exception:
+                close_v = 0.0
+            if close_v <= 0:
+                continue
+            dt = pd.to_datetime(row.get("trade_date"), errors="coerce")
+            if pd.isna(dt):
+                continue
+            rows.append(
+                {
+                    "trade_date": dt.strftime("%Y%m%d"),
+                    "open": float(row.get("open", close_v) or close_v),
+                    "high": float(row.get("high", close_v) or close_v),
+                    "low": float(row.get("low", close_v) or close_v),
+                    "close": close_v,
+                    "pct_chg": float(row.get("pct_chg", 0.0) or 0.0),
+                    "vol": float(row.get("vol", 0.0) or 0.0),
+                    "name": "",
+                }
+            )
+        rows = sorted(rows, key=lambda x: x.get("trade_date", ""))
+        if len(rows) < 5:
+            return [], {}
+        return self._trend_fetcher.extract_stage_feature_vector(rows)
+
+    def _calc_path_similarity(self, target_df: pd.DataFrame, cand_df: pd.DataFrame) -> float:
+        if target_df is None or cand_df is None or target_df.empty or cand_df.empty:
+            return 0.0
+
+        def _norm_close(df: pd.DataFrame) -> List[float]:
+            col = "收盘" if "收盘" in df.columns else "close"
+            s = pd.to_numeric(df.get(col), errors="coerce").dropna()
+            if s.empty:
+                return []
+            base = float(s.iloc[0])
+            if base <= 0:
+                return []
+            arr = [float(x) / base for x in s.tolist()]
+            return arr
+
+        a = _norm_close(target_df)
+        b = _norm_close(cand_df)
+        n = min(len(a), len(b))
+        if n < 6:
+            return 0.0
+        a = a[-n:]
+        b = b[-n:]
+
+        dist = math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(n)))
+        euclid_sim = 1.0 / (1.0 + dist)
+
+        mean_a = sum(a) / n
+        mean_b = sum(b) / n
+        var_a = sum((x - mean_a) ** 2 for x in a)
+        var_b = sum((x - mean_b) ** 2 for x in b)
+        corr_norm = 0.0
+        if var_a > 1e-12 and var_b > 1e-12:
+            cov = sum((a[i] - mean_a) * (b[i] - mean_b) for i in range(n))
+            corr = cov / math.sqrt(var_a * var_b)
+            corr_norm = max(0.0, min(1.0, (corr + 1.0) / 2.0))
+
+        return 0.5 * euclid_sim + 0.5 * corr_norm
+
+    def _calc_similarity_score(self, target_vec: List[float], cand_vec: List[float]) -> Tuple[float, float, float]:
+        if not target_vec or not cand_vec:
+            return 0.0, 0.0, 0.0
+        size = min(len(target_vec), len(cand_vec))
+        if size <= 1:
+            return 0.0, 0.0, 0.0
+
+        a = [float(target_vec[i]) for i in range(size)]
+        b = [float(cand_vec[i]) for i in range(size)]
+
+        mean_a = sum(a) / size
+        mean_b = sum(b) / size
+        var_a = sum((x - mean_a) ** 2 for x in a)
+        var_b = sum((x - mean_b) ** 2 for x in b)
+        if var_a <= 1e-12 or var_b <= 1e-12:
+            corr = 0.0
+        else:
+            cov = sum((a[i] - mean_a) * (b[i] - mean_b) for i in range(size))
+            corr = cov / math.sqrt(var_a * var_b)
+        corr_norm = max(0.0, min(1.0, (corr + 1.0) / 2.0))
+
+        dist = math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(size)))
+        euclid_sim = 1.0 / (1.0 + dist)
+        final_score = 0.6 * corr_norm + 0.4 * euclid_sim
+        return final_score, corr_norm, euclid_sim
+
+    def _build_mainboard_universe(self, limit: Optional[int] = None) -> List[str]:
+        stock_map = self._get_stock_name_map()
+        symbols = []
+        for symbol in stock_map.keys():
+            if not symbol:
+                continue
+            if self._is_filtered_market(symbol):
+                continue
+            if symbol.startswith("8") or symbol.startswith("4"):
+                continue
+            symbols.append(symbol)
+        symbols = sorted(set(symbols))
+        if limit is None:
+            return symbols
+        cap = max(80, min(int(limit or 220), 1200))
+        return symbols[:cap]
+
+    def _parse_date_flexible(self, value: Any) -> Optional[datetime]:
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            return value
+        if hasattr(value, "strftime"):
+            try:
+                return datetime.strptime(value.strftime("%Y-%m-%d"), "%Y-%m-%d")
+            except Exception:
+                pass
+        text = str(value).strip().replace("/", "-").replace(".", "-")
+        if not text:
+            return None
+        for fmt in ("%Y-%m-%d", "%Y%m%d"):
+            try:
+                return datetime.strptime(text, fmt)
+            except Exception:
+                continue
+        return None
 
     def _apply_ai_second_review(
         self,
@@ -303,8 +1109,9 @@ class ThemePeerSelector:
             return []
         return []
 
-    def _get_ai_client(self) -> DeepSeekClient:
+    def _get_ai_client(self):
         if self._ai_client is None:
+            from deepseek_client import DeepSeekClient
             self._ai_client = DeepSeekClient()
         return self._ai_client
 

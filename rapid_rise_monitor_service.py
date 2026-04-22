@@ -2,6 +2,7 @@ import json
 import os
 import threading
 import time
+import traceback
 from collections import defaultdict, deque
 from datetime import datetime
 from typing import Dict, List
@@ -42,7 +43,18 @@ class RapidRiseMonitorService:
         self.pending_summary = defaultdict(list)
         self.last_summary_ts = 0.0
 
+        self.calendar = TradeCalendarService()
         self.history_service = LonghubangHistoryService()
+
+        self.last_status = {
+            'last_loop_at': '',
+            'last_error': '',
+            'last_error_trace': '',
+            'last_symbols_load': 0,
+            'last_quotes_count': 0,
+            'last_event_count': 0,
+            'last_skip_reason': '',
+        }
 
     def get_runtime_config(self) -> Dict:
         return {
@@ -58,6 +70,7 @@ class RapidRiseMonitorService:
             'summary_max_items': self.summary_max_items,
             'running': self.running,
             'symbols_count': len(self.symbols),
+            'last_status': self.last_status,
         }
 
     def update_runtime_config(
@@ -82,8 +95,13 @@ class RapidRiseMonitorService:
 
     def start(self):
         if not self.enabled or self.running:
+            if not self.enabled:
+                self.last_status['last_skip_reason'] = 'pipeline_disabled'
             return
         self.running = True
+        self.last_status['last_error'] = ''
+        self.last_status['last_error_trace'] = ''
+        self.last_status['last_skip_reason'] = ''
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
@@ -95,25 +113,40 @@ class RapidRiseMonitorService:
     def _loop(self):
         while self.running:
             try:
+                self.last_status['last_loop_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+
                 if not self._is_trading_session():
+                    self.last_status['last_skip_reason'] = 'non_trading_session'
                     time.sleep(min(self.interval_sec, 20))
                     continue
 
-                if not self.symbols:
-                    self.symbols = self._load_symbols()
+                self.last_status['last_skip_reason'] = ''
 
                 if not self.symbols:
+                    self.symbols = self._load_symbols()
+                    self.last_status['last_symbols_load'] = len(self.symbols)
+
+                if not self.symbols:
+                    self.last_status['last_skip_reason'] = 'empty_symbol_pool'
                     time.sleep(self.interval_sec)
                     continue
 
+                total_quotes = 0
+                total_events = 0
                 for i in range(0, len(self.symbols), self.batch_size):
                     batch = self.symbols[i:i + self.batch_size]
                     quotes = self._fetch_batch_quotes(batch)
-                    self._process_quotes(quotes)
+                    total_quotes += len(quotes)
+                    total_events += self._process_quotes(quotes)
+
+                self.last_status['last_quotes_count'] = total_quotes
+                self.last_status['last_event_count'] = total_events
 
                 self._maybe_push_summary()
                 time.sleep(self.interval_sec)
-            except Exception:
+            except Exception as e:
+                self.last_status['last_error'] = str(e)
+                self.last_status['last_error_trace'] = traceback.format_exc(limit=5)
                 time.sleep(max(10, self.interval_sec))
 
     def _is_trading_session(self) -> bool:
@@ -151,10 +184,11 @@ class RapidRiseMonitorService:
         except Exception:
             return []
 
-    def _process_quotes(self, quotes: List[Dict]):
+    def _process_quotes(self, quotes: List[Dict]) -> int:
         now = datetime.now()
         event_time = now.strftime('%Y-%m-%d %H:%M:%S')
         trade_date = now.strftime('%Y%m%d')
+        event_count = 0
 
         for q in quotes:
             code = str(q.get('Code', '')).strip()
@@ -234,6 +268,10 @@ class RapidRiseMonitorService:
                 self._collect_summary(event)
                 monitor_db.add_rapid_rise_push_record(event_id, 'default', 'suppressed', 'rate_limited')
 
+            event_count += 1
+
+        return event_count
+
     def _pct_change(self, window: deque, seconds: int) -> float:
         if not window:
             return 0.0
@@ -248,33 +286,52 @@ class RapidRiseMonitorService:
             return 0.0
         return (latest - base) / base * 100
 
+    def _amount_delta_series(self, code: str) -> List[tuple]:
+        rows = list(self.amount_windows[code])
+        if len(rows) < 2:
+            return []
+        out = []
+        for i in range(1, len(rows)):
+            ts, amount = rows[i]
+            prev_amount = rows[i - 1][1]
+            delta = float(amount) - float(prev_amount)
+            # Amount 为当日累计成交额，增量应为非负；异常回退为0
+            out.append((ts, delta if delta > 0 else 0.0))
+        return out
+
     def _amount_in_window(self, code: str, seconds: int) -> float:
-        w = self.amount_windows[code]
-        if not w:
+        deltas = self._amount_delta_series(code)
+        if not deltas:
             return 0.0
         now_ts = time.time()
-        vals = [v for ts, v in w if now_ts - ts <= seconds]
-        if not vals:
-            return 0.0
-        return max(vals)
+        return sum(v for ts, v in deltas if now_ts - ts <= seconds)
 
     def _amount_ratio_1m20(self, code: str) -> float:
-        w = self.amount_windows[code]
-        if len(w) < 3:
+        deltas = self._amount_delta_series(code)
+        if len(deltas) < 5:
             return 0.0
+
         now_ts = time.time()
-        vals_1m = [v for ts, v in w if now_ts - ts <= 60]
-        vals_20m = [v for ts, v in w if now_ts - ts <= 1200]
-        if not vals_1m or len(vals_20m) < 5:
+        win_1m = [(ts, v) for ts, v in deltas if now_ts - ts <= 60]
+        win_20m = [(ts, v) for ts, v in deltas if now_ts - ts <= 1200]
+        if not win_1m or len(win_20m) < 5:
             return 0.0
-        current = max(vals_1m)
-        avg_20 = sum(vals_20m) / len(vals_20m)
-        if avg_20 <= 0:
+
+        amt_1m = sum(v for _, v in win_1m)
+        amt_20m = sum(v for _, v in win_20m)
+        if amt_1m <= 0 or amt_20m <= 0:
             return 0.0
-        return current / avg_20
+
+        oldest_ts = min(ts for ts, _ in win_20m)
+        covered_sec = max(60.0, min(1200.0, now_ts - oldest_ts))
+        avg_per_min_20m = amt_20m / (covered_sec / 60.0)
+        if avg_per_min_20m <= 0:
+            return 0.0
+
+        return amt_1m / avg_per_min_20m
 
     def _is_trigger(self, rise_1m: float, rise_3m: float, amt_ratio: float) -> bool:
-        return (rise_1m >= self.threshold_1m or rise_3m >= self.threshold_3m) and amt_ratio >= self.threshold_amt_ratio
+        return (rise_1m >= self.threshold_1m or rise_3m >= self.threshold_3m)
 
     def _trigger_level(self, rise_1m: float, rise_3m: float) -> str:
         if rise_1m >= 2.5 or rise_3m >= 4.0:
