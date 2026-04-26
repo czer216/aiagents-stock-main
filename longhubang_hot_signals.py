@@ -810,6 +810,7 @@ class KPLListHeatFetcher:
                         "trade_date": trade_date,
                         "rank": rec.get("rank", 9999),
                         "change_pct": rec.get("change_pct", 0.0),
+                        "status": rec.get("status", ""),
                         "themes": themes,
                         "name": rec.get("name", ""),
                     }
@@ -876,6 +877,7 @@ class KPLListHeatFetcher:
                 "latest_rank": latest_rank,
                 "appear_days": appear_days,
                 "avg_chg": round(avg_chg, 2),
+                "status": str(items[0].get("status", "") or "").strip(),
                 "themes": [t for t, _ in theme_counter.most_common(5)],
             }
 
@@ -1059,6 +1061,7 @@ class KPLListHeatFetcher:
                     change_col = col
                     break
         tag_col = self._find_col(df, ["tag", "标签", "类型", "类别"])
+        status_col = self._find_col(df, ["status", "连板", "板", "高度", "梯队"])
 
         rows: List[Dict[str, Any]] = []
         for idx, row in df.iterrows():
@@ -1074,9 +1077,18 @@ class KPLListHeatFetcher:
             themes = self._split_themes(row.get(theme_col)) if theme_col else []
             reason = self._clean_text(row.get(reason_col)) if reason_col else ""
             change_pct = self._safe_number(row.get(change_col)) if change_col else 0.0
+            if change_col and abs(float(change_pct)) < 1e-9:
+                for alt_col in ["pct_chg", "pct_change", "change_pct", "涨跌幅", "涨幅", "pct", "changepercent"]:
+                    if alt_col == change_col or alt_col not in df.columns:
+                        continue
+                    alt_val = self._safe_number(row.get(alt_col))
+                    if abs(float(alt_val)) > 1e-9:
+                        change_pct = alt_val
+                        break
             # 防御性阈值：超过正常日涨跌幅范围，视为字段误映射，置0
             if abs(float(change_pct)) > 60:
                 change_pct = 0.0
+            status_text = self._clean_text(row.get(status_col)) if status_col else ""
             rows.append(
                 {
                     "code": code,
@@ -1086,6 +1098,7 @@ class KPLListHeatFetcher:
                     "themes_text": "、".join(themes[:3]) if themes else "",
                     "reason": reason[:80] if reason else "",
                     "change_pct": round(change_pct, 2),
+                    "status": status_text,
                 }
             )
 

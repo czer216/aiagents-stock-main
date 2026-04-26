@@ -43,6 +43,8 @@ class LonghubangScoring:
         limit_step_data: Dict[str, Any] = None,
         ths_hot_data: Dict[str, Any] = None,
         p1_signal_data: Dict[str, Any] = None,
+        market_style_context: Dict[str, Any] = None,
+        sector_tier_map: Dict[str, str] = None,
     ) -> float:
         """
         计算单个股票的综合评分
@@ -82,6 +84,24 @@ class LonghubangScoring:
         # 8. 同花顺热榜评分 (0-10分)
         ths_hot_score = self._calculate_ths_hot_score(stock_data, ths_hot_data)
         
+        # 辅助标签低权重微调（不改变主因子主导）
+        p1_detail = self._get_p1_detail(stock_data, p1_signal_data)
+        stock_concepts = self._get_enriched_stock_concepts(
+            stock_data,
+            concept_rotation_data=concept_rotation_data,
+            limit_step_data=limit_step_data,
+        )
+        position_tag = self._derive_stock_position_tag(p1_detail)
+        capital_behavior_tag = self._derive_capital_behavior_tag(p1_detail)
+        sector_tier = self._resolve_sector_tier(stock_concepts, sector_tier_map)
+        style_regime = str((market_style_context or {}).get("style_regime", "balanced") or "balanced")
+        helper_adjust = self._calc_helper_adjust(
+            position_tag=position_tag,
+            capital_behavior_tag=capital_behavior_tag,
+            sector_tier=sector_tier,
+            style_regime=style_regime,
+        )
+
         # 综合评分
         total_score = (
             capital_quality_score +
@@ -91,9 +111,11 @@ class LonghubangScoring:
             bonus_score +
             rotation_score +
             step_score +
-            ths_hot_score
+            ths_hot_score +
+            helper_adjust
         )
-        
+        total_score = max(0.0, min(100.0, total_score))
+
         return round(total_score, 1)
     
     def _calculate_capital_quality(
@@ -615,6 +637,86 @@ class LonghubangScoring:
             return text
         return ""
 
+    def _derive_stock_position_tag(self, p1_detail: Dict[str, Any]) -> str:
+        status = str((p1_detail or {}).get("today_limit_up_status", "") or "").strip()
+        streak = 0
+        m = re.search(r"(\d+)\s*天\s*(\d+)\s*板", status)
+        if m:
+            try:
+                streak = int(m.group(2))
+            except Exception:
+                streak = 0
+        if streak >= 4:
+            return "high_divergence"
+        if streak >= 2:
+            return "mid_accel"
+        quality = float((p1_detail or {}).get("limit_quality_score", 0.0) or 0.0)
+        if quality >= 0.65:
+            return "low_start"
+        if float((p1_detail or {}).get("main_net_amt_sum", 0.0) or 0.0) < 0:
+            return "fading"
+        return "low_start"
+
+    def _derive_capital_behavior_tag(self, p1_detail: Dict[str, Any]) -> str:
+        p1 = dict(p1_detail or {})
+        inst_net = float(p1.get("inst_net_amt", 0.0) or 0.0)
+        youzi_net = float(p1.get("youzi_net_amt_sum", 0.0) or 0.0)
+        main_net = float(p1.get("main_net_amt_sum", 0.0) or 0.0)
+        if inst_net > 0 and inst_net >= abs(youzi_net) * 0.8:
+            return "institutional_led"
+        if youzi_net > 0 and youzi_net >= abs(inst_net) * 0.8:
+            return "hot_money_led"
+        if main_net < 0 and youzi_net < 0:
+            return "distribution_pressure"
+        return "mixed"
+
+    def _resolve_sector_tier(self, stock_concepts: List[str], sector_tier_map: Dict[str, str] = None) -> str:
+        normalized_map = {
+            self._normalize_theme_key(k): str(v or "rotation")
+            for k, v in dict(sector_tier_map or {}).items()
+            if self._normalize_theme_key(k)
+        }
+        if not stock_concepts or not normalized_map:
+            return "rotation"
+        rank = {"mainline": 4, "secondary": 3, "rotation": 2, "fading": 1}
+        best = "rotation"
+        best_score = 0
+        for concept in stock_concepts:
+            key = self._normalize_theme_key(concept)
+            tier = normalized_map.get(key, "")
+            s = rank.get(tier, 0)
+            if s > best_score:
+                best_score = s
+                best = tier
+        return best
+
+    def _normalize_theme_key(self, text: Any) -> str:
+        s = str(text or "").strip().lower()
+        if not s:
+            return ""
+        s = re.sub(r"[\s\-\_＋+,，;；/|、]+", "", s)
+        s = re.sub(r"(概念|题材|板块|方向)$", "", s)
+        return s
+
+    def _calc_helper_adjust(
+        self,
+        position_tag: str,
+        capital_behavior_tag: str,
+        sector_tier: str,
+        style_regime: str,
+    ) -> float:
+        pos_map = {"low_start": 1.5, "mid_accel": 0.8, "high_divergence": -1.8, "fading": -2.4}
+        cap_map = {"institutional_led": 1.8, "hot_money_led": 1.0, "mixed": 0.0, "distribution_pressure": -2.0}
+        sector_map = {"mainline": 1.2, "secondary": 0.6, "rotation": 0.0, "fading": -1.2}
+        style_map = {"risk_on": 0.8, "balanced": 0.0, "defensive": -0.8}
+        raw = (
+            float(pos_map.get(str(position_tag or ""), 0.0))
+            + float(cap_map.get(str(capital_behavior_tag or ""), 0.0))
+            + float(sector_map.get(str(sector_tier or ""), 0.0))
+            + float(style_map.get(str(style_regime or ""), 0.0))
+        )
+        return round(max(-6.0, min(6.0, raw)), 2)
+
     def _get_p1_detail(
         self, stock_data: List[Dict], p1_signal_data: Dict[str, Any] = None
     ) -> Dict[str, Any]:
@@ -752,6 +854,8 @@ class LonghubangScoring:
         limit_step_data: Dict[str, Any] = None,
         ths_hot_data: Dict[str, Any] = None,
         p1_signal_data: Dict[str, Any] = None,
+        market_style_context: Dict[str, Any] = None,
+        sector_tier_map: Dict[str, str] = None,
     ) -> pd.DataFrame:
         """
         对所有上榜股票进行评分排名
@@ -810,6 +914,23 @@ class LonghubangScoring:
                 + limit_step_score
                 + ths_hot_score
             )
+            stock_concepts = self._get_enriched_stock_concepts(
+                records,
+                concept_rotation_data=concept_rotation_data,
+                limit_step_data=limit_step_data,
+            )
+            p1_detail = self._get_p1_detail(records, p1_signal_data)
+            position_tag = self._derive_stock_position_tag(p1_detail)
+            capital_behavior_tag = self._derive_capital_behavior_tag(p1_detail)
+            sector_tier = self._resolve_sector_tier(stock_concepts, sector_tier_map)
+            style_regime = str((market_style_context or {}).get("style_regime", "balanced") or "balanced")
+            helper_adjust = self._calc_helper_adjust(
+                position_tag=position_tag,
+                capital_behavior_tag=capital_behavior_tag,
+                sector_tier=sector_tier,
+                style_regime=style_regime,
+            )
+            total_score = max(0.0, min(100.0, total_score + helper_adjust))
             
             # 计算实际数据（安全转换）
             total_buy = 0.0
@@ -849,11 +970,6 @@ class LonghubangScoring:
                                         for kw in self.institution_keywords))
             
             primary_code = self._get_primary_stock_code(records)
-            stock_concepts = self._get_enriched_stock_concepts(
-                records,
-                concept_rotation_data=concept_rotation_data,
-                limit_step_data=limit_step_data,
-            )
 
             matched_hot_concepts = ""
             matched_hot_concepts_set = []
@@ -883,7 +999,6 @@ class LonghubangScoring:
                 ths_detail = (ths_hot_data.get("stock_hot_map", {}) or {}).get(primary_code, {})
             best_rank = int(ths_detail.get("best_rank", 0) or 0)
             best_rank_display = f"TOP {best_rank}" if best_rank > 0 else "-"
-            p1_detail = self._get_p1_detail(records, p1_signal_data)
             # 判断机构参与
             has_institution = institution_count > 0
             
@@ -914,6 +1029,11 @@ class LonghubangScoring:
                 '封板质量': round(float(p1_detail.get("limit_quality_score", 0.0) or 0.0) * 10, 1),
                 '游资信号': round(float(p1_detail.get("youzi_signal_score", 0.0) or 0.0) * 10, 1),
                 '游资画像': p1_detail.get("top_hm_name", "") or "-",
+                '辅助微调': round(float(helper_adjust), 2),
+                '位置标签': position_tag,
+                '资金行为': capital_behavior_tag,
+                '板块分层': sector_tier,
+                '市场风格': style_regime,
             })
         
         # 转换为DataFrame并排序

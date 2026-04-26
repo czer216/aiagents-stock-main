@@ -88,6 +88,8 @@ def display_monitor_status():
             st.rerun()
 
     st.markdown("### ⚡ 全市场快速拉升")
+    if not rapid_rise_monitor_service.running:
+        rapid_rise_monitor_service.start()
     rr_cfg = rapid_rise_monitor_service.get_runtime_config()
     rr_col1, rr_col2, rr_col3, rr_col4 = st.columns(4)
 

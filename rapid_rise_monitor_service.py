@@ -331,12 +331,12 @@ class RapidRiseMonitorService:
         return amt_1m / avg_per_min_20m
 
     def _is_trigger(self, rise_1m: float, rise_3m: float, amt_ratio: float) -> bool:
-        return (rise_1m >= self.threshold_1m or rise_3m >= self.threshold_3m)
+        return rise_1m >= self.threshold_1m
 
     def _trigger_level(self, rise_1m: float, rise_3m: float) -> str:
-        if rise_1m >= 2.5 or rise_3m >= 4.0:
+        if rise_1m >= 2.5:
             return 'L3'
-        if rise_1m >= 1.8 or rise_3m >= 3.0:
+        if rise_1m >= 1.8:
             return 'L2'
         return 'L1'
 

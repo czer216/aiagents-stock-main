@@ -46,6 +46,7 @@ class SevenDayKlineTrendFetcher:
             "stock_trend_map": {},
             "trend_summary": {},
             "top_strength": [],
+            "weekly_summary": {},
         }
 
         pro = self.data_source_manager.tushare_api
@@ -91,6 +92,23 @@ class SevenDayKlineTrendFetcher:
             result["error"] = "未获取到有效的K线趋势数据"
             return result
 
+        weekly_data = self.get_weekly_trend_data(days=6, end_date=end_date, stock_codes=target_codes)
+        weekly_map = (weekly_data or {}).get("stock_weekly_map", {}) or {}
+        for code, detail in stock_trend_map.items():
+            weekly_detail = weekly_map.get(code, {}) or {}
+            if weekly_detail:
+                detail["weekly_trend_stage"] = str(weekly_detail.get("weekly_trend_stage", "") or "")
+                detail["weekly_change_pct"] = round(float(weekly_detail.get("weekly_change_pct", 0.0) or 0.0), 2)
+                detail["weekly_up_streak"] = int(weekly_detail.get("weekly_up_streak", 0) or 0)
+                detail["weekly_vol_ratio"] = round(float(weekly_detail.get("weekly_vol_ratio", 0.0) or 0.0), 2)
+                detail["weekly_trend_score"] = round(float(weekly_detail.get("weekly_trend_score", 0.5) or 0.5), 3)
+            else:
+                detail["weekly_trend_stage"] = ""
+                detail["weekly_change_pct"] = 0.0
+                detail["weekly_up_streak"] = 0
+                detail["weekly_vol_ratio"] = 0.0
+                detail["weekly_trend_score"] = 0.5
+
         stage_counter = Counter(str(v.get("trend_stage", "")) for v in stock_trend_map.values())
         top_strength = sorted(
             [
@@ -122,6 +140,7 @@ class SevenDayKlineTrendFetcher:
                     "high_shake_count": int(stage_counter.get("高位震荡", 0)),
                     "decline_count": int(stage_counter.get("退潮期", 0)),
                 },
+                "weekly_summary": (weekly_data or {}).get("weekly_summary", {}) or {},
             }
         )
         return result
@@ -360,6 +379,187 @@ class SevenDayKlineTrendFetcher:
                 seen.add(code)
                 out.append(code)
         return out
+
+    def get_weekly_trend_data(
+        self,
+        days: int = 6,
+        end_date: Optional[str] = None,
+        stock_codes: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        window_weeks = max(4, min(int(days or 6), 12))
+        result: Dict[str, Any] = {
+            "data_success": False,
+            "source": "tushare.weekly",
+            "query_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "window_weeks": window_weeks,
+            "stock_weekly_map": {},
+            "weekly_summary": {},
+        }
+
+        pro = self.data_source_manager.tushare_api
+        if not self.data_source_manager.tushare_available or pro is None:
+            result["error"] = "Tushare不可用或未配置Token"
+            return result
+        if not hasattr(pro, "weekly"):
+            result["error"] = "当前Tushare权限或版本不支持 weekly"
+            return result
+
+        target_codes = self._normalize_codes(stock_codes or [])
+        if not target_codes:
+            result["error"] = "未提供股票代码"
+            return result
+
+        end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        start_dt = datetime.strptime(end8, "%Y%m%d") - timedelta(days=window_weeks * 9)
+        start8 = start_dt.strftime("%Y%m%d")
+
+        stock_weekly_map: Dict[str, Dict[str, Any]] = {}
+        for code in target_codes:
+            ts_code = self._to_ts_code(code)
+            if not ts_code:
+                continue
+            df = self._fetch_weekly_for_ts_code(ts_code=ts_code, start_date=start8, end_date=end8)
+            if df is None or df.empty:
+                continue
+            detail = self._calc_weekly_detail(df=df, code=code)
+            if detail:
+                stock_weekly_map[code] = detail
+
+        if not stock_weekly_map:
+            result["error"] = "未获取到有效周线数据"
+            return result
+
+        stage_counter = Counter(str(v.get("weekly_trend_stage", "")) for v in stock_weekly_map.values())
+        result.update(
+            {
+                "data_success": True,
+                "stock_weekly_map": stock_weekly_map,
+                "weekly_summary": {
+                    "tracked_stocks": len(stock_weekly_map),
+                    "window_weeks": window_weeks,
+                    "stage_distribution": {k: int(v) for k, v in stage_counter.items() if k},
+                },
+            }
+        )
+        return result
+
+    def _fetch_weekly_for_ts_code(self, ts_code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        pro = self.data_source_manager.tushare_api
+        candidates = [
+            {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+                "fields": "ts_code,trade_date,open,high,low,close,pct_chg,vol",
+            },
+            {
+                "ts_code": ts_code,
+                "start_date": start_date,
+                "end_date": end_date,
+            },
+        ]
+        for kwargs in candidates:
+            try:
+                df = call_tushare_with_timeout(
+                    api_callable=lambda: pro.weekly(**kwargs),
+                    timeout_sec=60,
+                    api_name="weekly",
+                )
+            except Exception:
+                continue
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return None
+
+    def _calc_weekly_detail(self, df: pd.DataFrame, code: str) -> Dict[str, Any]:
+        if df is None or df.empty:
+            return {}
+        date_col = self._find_col(df, ["trade_date", "date", "日期"])
+        close_col = self._find_col(df, ["close", "收盘"])
+        pct_col = self._find_col(df, ["pct_chg", "pct_change", "涨跌幅", "pct"])
+        vol_col = self._find_col(df, ["vol", "volume", "成交量"])
+        if not close_col:
+            return {}
+
+        rows = []
+        for _, row in df.iterrows():
+            close_v = float(self._safe_number(row.get(close_col))) if close_col else 0.0
+            if close_v <= 0:
+                continue
+            pct_v = float(self._safe_number(row.get(pct_col))) if pct_col else 0.0
+            vol_v = float(self._safe_number(row.get(vol_col))) if vol_col else 0.0
+            d8 = self._norm_trade_date(row.get(date_col)) if date_col else ""
+            rows.append({"trade_date": d8, "close": close_v, "pct_chg": pct_v, "vol": vol_v})
+        if len(rows) < 2:
+            return {}
+        rows = sorted(rows, key=lambda x: x.get("trade_date", ""))
+
+        closes = [float(x.get("close", 0.0) or 0.0) for x in rows if float(x.get("close", 0.0) or 0.0) > 0]
+        if len(closes) < 2:
+            return {}
+
+        weekly_change = (closes[-1] - closes[0]) / closes[0] * 100.0 if closes[0] > 0 else 0.0
+        up_streak = 0
+        for i in range(len(rows) - 1, 0, -1):
+            p = float(rows[i].get("pct_chg", 0.0) or 0.0)
+            if abs(p) < 1e-9:
+                prev = float(rows[i - 1].get("close", 0.0) or 0.0)
+                cur = float(rows[i].get("close", 0.0) or 0.0)
+                if prev > 0:
+                    p = (cur - prev) / prev * 100.0
+            if p > 0:
+                up_streak += 1
+            else:
+                break
+
+        vols = [float(x.get("vol", 0.0) or 0.0) for x in rows if float(x.get("vol", 0.0) or 0.0) > 0]
+        vol_ratio = 0.0
+        if len(vols) >= 2:
+            prev_avg = sum(vols[:-1]) / max(len(vols) - 1, 1)
+            if prev_avg > 0:
+                vol_ratio = vols[-1] / prev_avg
+
+        if weekly_change >= 10:
+            stage = "周线强势"
+            score = 1.0
+        elif weekly_change >= 4:
+            stage = "周线偏强"
+            score = 0.72
+        elif weekly_change <= -8:
+            stage = "周线走弱"
+            score = 0.2
+        elif weekly_change <= -3:
+            stage = "周线偏弱"
+            score = 0.35
+        else:
+            stage = "周线震荡"
+            score = 0.5
+
+        return {
+            "code": code,
+            "weekly_trend_stage": stage,
+            "weekly_trend_score": round(float(score), 3),
+            "weekly_change_pct": round(float(weekly_change), 2),
+            "weekly_up_streak": int(up_streak),
+            "weekly_vol_ratio": round(float(vol_ratio), 2),
+            "latest_week_trade_date": self._fmt_trade_date(rows[-1].get("trade_date", "")),
+        }
+
+    def _normalize_codes(self, codes: List[Any]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for item in codes:
+            code = self._normalize_code(item)
+            if code and code not in seen:
+                seen.add(code)
+                out.append(code)
+        return out
+
+    def _to_ts_code(self, code: str) -> str:
+        text = self._normalize_code(code)
+        if not text:
+            return ""
+        return f"{text}.SH" if text.startswith("6") else f"{text}.SZ"
 
     def _normalize_code(self, value: Any) -> str:
         text = self._clean_text(value)

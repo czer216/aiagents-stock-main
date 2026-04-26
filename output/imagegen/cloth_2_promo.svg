@@ -1,0 +1,70 @@
+<svg width="1242" height="1660" viewBox="0 0 1242 1660" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1242" y2="1660" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#F7E8D5"/>
+      <stop offset="1" stop-color="#F2D8BF"/>
+    </linearGradient>
+    <linearGradient id="card" x1="145" y1="260" x2="1097" y2="1240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFDF9"/>
+      <stop offset="1" stop-color="#F6EDE3"/>
+    </linearGradient>
+    <filter id="shadow" x="96" y="214" width="1050" height="1084" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feFlood flood-opacity="0" result="BackgroundImageFix"/>
+      <feColorMatrix in="SourceAlpha" type="matrix" values="0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 127 0" result="hardAlpha"/>
+      <feOffset dy="24"/>
+      <feGaussianBlur stdDeviation="24"/>
+      <feColorMatrix type="matrix" values="0 0 0 0 0.398435 0 0 0 0 0.277045 0 0 0 0 0.18197 0 0 0 0.16 0"/>
+      <feBlend mode="normal" in2="BackgroundImageFix" result="effect1_dropShadow_1_1"/>
+      <feBlend mode="normal" in="SourceGraphic" in2="effect1_dropShadow_1_1" result="shape"/>
+    </filter>
+    <clipPath id="photoClip">
+      <rect x="181" y="296" width="880" height="880" rx="42"/>
+    </clipPath>
+  </defs>
+
+  <rect width="1242" height="1660" fill="url(#bg)"/>
+  <circle cx="1110" cy="132" r="190" fill="#F4D4C1" fill-opacity="0.72"/>
+  <circle cx="116" cy="1490" r="220" fill="#EBC6AF" fill-opacity="0.48"/>
+  <circle cx="1024" cy="1496" r="132" fill="#F8EBDD" fill-opacity="0.95"/>
+
+  <g opacity="0.3">
+    <circle cx="104" cy="112" r="8" fill="#151515"/>
+    <circle cx="138" cy="112" r="8" fill="#151515"/>
+    <circle cx="172" cy="112" r="8" fill="#151515"/>
+    <circle cx="104" cy="146" r="8" fill="#151515"/>
+    <circle cx="138" cy="146" r="8" fill="#151515"/>
+    <circle cx="172" cy="146" r="8" fill="#151515"/>
+    <circle cx="1070" cy="1424" r="8" fill="#151515"/>
+    <circle cx="1104" cy="1424" r="8" fill="#151515"/>
+    <circle cx="1138" cy="1424" r="8" fill="#151515"/>
+    <circle cx="1070" cy="1458" r="8" fill="#151515"/>
+    <circle cx="1104" cy="1458" r="8" fill="#151515"/>
+    <circle cx="1138" cy="1458" r="8" fill="#151515"/>
+  </g>
+
+  <text x="105" y="142" fill="#1A1715" font-family="PingFang SC, sans-serif" font-size="34" font-weight="600" letter-spacing="6">SPRING LOOK</text>
+  <text x="105" y="220" fill="#151515" font-family="PingFang SC, sans-serif" font-size="84" font-weight="700">法式波点套装</text>
+  <text x="105" y="274" fill="#5F5147" font-family="PingFang SC, sans-serif" font-size="32" font-weight="400">黑白撞色 + 收腰设计，一套穿出精致氛围感</text>
+
+  <g filter="url(#shadow)">
+    <rect x="145" y="260" width="952" height="986" rx="54" fill="url(#card)"/>
+    <rect x="181" y="296" width="880" height="880" rx="42" fill="#EFE1D0"/>
+    <g clip-path="url(#photoClip)">
+      <image href="file:///Users/cz/Desktop/xiaohongshu-clothes/cloth_2.jpg" x="181" y="296" width="880" height="880" preserveAspectRatio="xMidYMid slice"/>
+    </g>
+  </g>
+
+  <rect x="814" y="342" width="206" height="84" rx="42" fill="#151515"/>
+  <text x="917" y="396" text-anchor="middle" fill="#FFF9F2" font-family="PingFang SC, sans-serif" font-size="34" font-weight="600">店主推荐</text>
+
+  <rect x="105" y="1288" width="1032" height="224" rx="38" fill="#FFF9F1" fill-opacity="0.84" stroke="#FFFFFF" stroke-opacity="0.7" stroke-width="3"/>
+
+  <text x="152" y="1364" fill="#151515" font-family="PingFang SC, sans-serif" font-size="36" font-weight="600">上身亮点</text>
+  <text x="152" y="1426" fill="#4A3E37" font-family="PingFang SC, sans-serif" font-size="30" font-weight="400">• 一字肩荷叶边，显肩颈线条更轻盈</text>
+  <text x="152" y="1482" fill="#4A3E37" font-family="PingFang SC, sans-serif" font-size="30" font-weight="400">• 黑白波点半裙，自带法式复古氛围</text>
+  <text x="640" y="1426" fill="#4A3E37" font-family="PingFang SC, sans-serif" font-size="30" font-weight="400">• 收腰剪裁，轻松穿出好比例</text>
+  <text x="640" y="1482" fill="#4A3E37" font-family="PingFang SC, sans-serif" font-size="30" font-weight="400">• 约会、逛街、拍照都很出片</text>
+
+  <rect x="105" y="1550" width="400" height="10" rx="5" fill="#151515" fill-opacity="0.85"/>
+  <text x="1137" y="1568" text-anchor="end" fill="#6A5A50" font-family="PingFang SC, sans-serif" font-size="24" font-weight="500" letter-spacing="3">XIAOHONGSHU POSTER</text>
+</svg>

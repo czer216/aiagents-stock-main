@@ -5,6 +5,7 @@
 
 from deepseek_client import DeepSeekClient
 from typing import Dict, Any, List, Optional
+from collections import Counter
 import time
 import logging
 import re
@@ -151,6 +152,8 @@ class LonghubangAgents:
         kline_9d_data: Optional[Dict[str, Any]] = None,
         trend_overlay_scale: float = 1.0,
         fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
+        market_style_context: Optional[Dict[str, Any]] = None,
+        sector_tier_map: Optional[Dict[str, str]] = None,
     ) -> str:
         lines = ["【龙虎榜补充热度信号（Tushare摘要）】"]
 
@@ -261,6 +264,14 @@ class LonghubangAgents:
                 f"分布 {stage_text}，"
                 f"强势TOP {top_text}"
             )
+            weekly_summary = (kline_9d_data.get("weekly_summary", {}) or {})
+            if weekly_summary:
+                weekly_dist = weekly_summary.get("stage_distribution", {}) or {}
+                weekly_text = "、".join([f"{k}:{v}" for k, v in weekly_dist.items() if v]) or "暂无"
+                lines.append(
+                    f"- 周线辅助（低权重）：覆盖 {weekly_summary.get('tracked_stocks', 0)} 只，"
+                    f"分布 {weekly_text}（仅作弱参考）"
+                )
             scale = max(0.0, min(float(trend_overlay_scale or 1.0), 10.0))
             if scale <= 0.0:
                 weight_tip = "已关闭（仅忽略）"
@@ -275,13 +286,40 @@ class LonghubangAgents:
                 f"请勿仅依据K线否定资金与题材主信号。"
             )
 
+        if isinstance(market_style_context, dict) and market_style_context:
+            heat_score = float(market_style_context.get("market_heat_score", 50.0) or 50.0)
+            market_temperature = str(market_style_context.get("market_temperature", "warm") or "warm")
+            style_regime = str(market_style_context.get("style_regime", "balanced") or "balanced")
+            style_conf = float(market_style_context.get("style_confidence", 0.0) or 0.0)
+            lines.append(
+                f"- 市场温度：{market_temperature}（热度分 {round(heat_score, 2)}），"
+                f"风格开关：{style_regime}（置信度 {round(style_conf, 2)}，仅作辅助）"
+            )
+
+        if fixed_candidate_stocks:
+            pos_counter = Counter(
+                str(x.get("lhb_position_tag", "") or "unknown") for x in fixed_candidate_stocks
+            )
+            cap_counter = Counter(
+                str(x.get("lhb_capital_behavior_tag", "") or "mixed") for x in fixed_candidate_stocks
+            )
+            sector_counter = Counter(
+                str(x.get("lhb_sector_tier", "") or "rotation") for x in fixed_candidate_stocks
+            )
+            pos_text = "、".join([f"{k}:{v}" for k, v in pos_counter.most_common(4)]) or "暂无"
+            cap_text = "、".join([f"{k}:{v}" for k, v in cap_counter.most_common(4)]) or "暂无"
+            sector_text = "、".join([f"{k}:{v}" for k, v in sector_counter.most_common(4)]) or "暂无"
+            lines.append(f"- 候选位置分布：{pos_text}")
+            lines.append(f"- 候选资金行为分布：{cap_text}")
+            lines.append(f"- 候选板块分层分布：{sector_text}")
+
         if len(lines) == 1:
             lines.append("- 暂无可用的补充热度信号（可能为Token权限或接口数据为空）")
 
         if fixed_candidate_stocks:
             lines.append("\n【固定候选池（统一上下文）】")
             lines.append("- 以下候选池为系统固定列表，所有分析师请在该范围内优先分析与推荐。")
-            lines.append("- 格式：序号. 股票名称(代码) | 净流入 | pct_chg | 当日涨停 | 近涨停标签 | 封板质量 | 数据质量(A/B/C) | 题材词")
+            lines.append("- 格式：序号. 股票名称(代码) | 净流入 | pct_chg | 当日涨停 | 连板状态 | 连板数 | 筹码胜率 | 筹码微调 | 近涨停标签 | 封板质量 | 数据质量(A/B/C) | 题材词")
             for idx, stock in enumerate((fixed_candidate_stocks or [])[:40], 1):
                 code = self._normalize_code(stock.get("code", ""))
                 if not code:
@@ -297,7 +335,20 @@ class LonghubangAgents:
                 except Exception:
                     pct_text = "-"
                 is_limit_up = "是" if bool(stock.get("is_today_limit_up", False)) else "否"
+                limit_up_status = str(stock.get("limit_up_status", "") or "").strip() or "-"
+                try:
+                    limit_up_streak = int(float(stock.get("limit_up_streak", 0) or 0))
+                except Exception:
+                    limit_up_streak = 0
                 is_limit_like = "是" if bool(stock.get("is_limit_like_for_quota", False)) else "否"
+                try:
+                    cyq_winner_rate = round(float(stock.get("cyq_winner_rate", 0.0) or 0.0), 4)
+                except Exception:
+                    cyq_winner_rate = 0.0
+                try:
+                    cyq_adjust = round(float(stock.get("cyq_adjust", 0.0) or 0.0), 3)
+                except Exception:
+                    cyq_adjust = 0.0
                 try:
                     limit_quality = round(float(stock.get("limit_quality_score", 0.0) or 0.0), 3)
                 except Exception:
@@ -310,7 +361,8 @@ class LonghubangAgents:
                     themes = "、".join([str(x) for x in (raw_themes or [])[:3] if str(x).strip()]) or "暂无"
                 lines.append(
                     f"{idx}. {name}({code}) | 净流入 {net_inflow:,.2f} | "
-                    f"pct_chg {pct_text} | 当日涨停 {is_limit_up} | 近涨停标签 {is_limit_like} | "
+                    f"pct_chg {pct_text} | 当日涨停 {is_limit_up} | 连板状态 {limit_up_status} | 连板数 {limit_up_streak} | "
+                    f"筹码胜率 {cyq_winner_rate:.4f} | 筹码微调 {cyq_adjust:.3f} | 近涨停标签 {is_limit_like} | "
                     f"封板质量 {limit_quality} | 数据质量 {quality_grade} | 题材词 {themes}"
                 )
             lines.append(f"- 固定候选池总数：{len(fixed_candidate_stocks)}")
@@ -327,10 +379,12 @@ class LonghubangAgents:
         kline_9d_data: Optional[Dict[str, Any]] = None,
         trend_overlay_scale: float = 1.0,
         fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
+        market_style_context: Optional[Dict[str, Any]] = None,
+        sector_tier_map: Optional[Dict[str, str]] = None,
     ) -> str:
         lines = [
             self._build_brief_signal_context(
-                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
+                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks, market_style_context, sector_tier_map
             )
         ]
 
@@ -408,10 +462,12 @@ class LonghubangAgents:
         kline_9d_data: Optional[Dict[str, Any]] = None,
         trend_overlay_scale: float = 1.0,
         fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
+        market_style_context: Optional[Dict[str, Any]] = None,
+        sector_tier_map: Optional[Dict[str, str]] = None,
     ) -> str:
         lines = [
             self._build_brief_signal_context(
-                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
+                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks, market_style_context, sector_tier_map
             )
         ]
         lines.append("\n【个股级热度信号（用于筛选次日关注股）】")
@@ -521,10 +577,12 @@ class LonghubangAgents:
         kline_9d_data: Optional[Dict[str, Any]] = None,
         trend_overlay_scale: float = 1.0,
         fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
+        market_style_context: Optional[Dict[str, Any]] = None,
+        sector_tier_map: Optional[Dict[str, str]] = None,
     ) -> str:
         lines = [
             self._build_brief_signal_context(
-                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
+                concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks, market_style_context, sector_tier_map
             )
         ]
         risk_flags: List[str] = []
@@ -604,6 +662,8 @@ class LonghubangAgents:
         p1_signal_data: Optional[Dict[str, Any]] = None,
         kline_9d_data: Optional[Dict[str, Any]] = None,
         trend_overlay_scale: float = 1.0,
+        market_style_context: Optional[Dict[str, Any]] = None,
+        sector_tier_map: Optional[Dict[str, str]] = None,
     ) -> str:
         lines = [
             self._build_brief_signal_context(
@@ -688,6 +748,8 @@ class LonghubangAgents:
         kline_9d_data: Optional[Dict[str, Any]] = None,
         trend_overlay_scale: float = 1.0,
         fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
+        market_style_context: Optional[Dict[str, Any]] = None,
+        sector_tier_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         游资行为分析师 - 分析游资操作特征和意图
@@ -707,7 +769,7 @@ class LonghubangAgents:
             for idx, (name, amount) in enumerate(list(summary['top_youzi'].items())[:15], 1):
                 youzi_info += f"{idx}. {name}: 净流入 {amount:,.2f} 元\n"
         youzi_signal_context = self._build_brief_signal_context(
-            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
+            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks, market_style_context, sector_tier_map
         )
         
         prompt = f"""
@@ -802,6 +864,8 @@ class LonghubangAgents:
         kline_9d_data: Optional[Dict[str, Any]] = None,
         trend_overlay_scale: float = 1.0,
         fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
+        market_style_context: Optional[Dict[str, Any]] = None,
+        sector_tier_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         个股潜力分析师 - 从龙虎榜数据挖掘潜力股
@@ -821,7 +885,7 @@ class LonghubangAgents:
             for idx, stock in enumerate(summary['top_stocks'][:20], 1):
                 stock_info += f"{idx}. {stock['name']}({stock['code']}): 净流入 {stock['net_inflow']:,.2f} 元\n"
         stock_signal_context = self._build_stock_signal_context(
-            summary, concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
+            summary, concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks, market_style_context, sector_tier_map
         )
         theme_whitelist_context = self._build_theme_whitelist_context(summary or {})
         stock_theme_binding_context = self._build_stock_theme_binding_context(summary or {})
@@ -925,6 +989,8 @@ class LonghubangAgents:
         kline_9d_data: Optional[Dict[str, Any]] = None,
         trend_overlay_scale: float = 1.0,
         fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
+        market_style_context: Optional[Dict[str, Any]] = None,
+        sector_tier_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         题材追踪分析师 - 分析龙虎榜中的热点题材
@@ -944,7 +1010,7 @@ class LonghubangAgents:
             for idx, (concept, count) in enumerate(list(summary['hot_concepts'].items())[:20], 1):
                 concept_info += f"{idx}. {concept}: 出现 {count} 次\n"
         theme_signal_context = self._build_theme_signal_context(
-            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
+            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks, market_style_context, sector_tier_map
         )
         theme_whitelist_context = self._build_theme_whitelist_context(summary or {})
         stock_theme_binding_context = self._build_stock_theme_binding_context(summary or {})
@@ -1045,6 +1111,8 @@ class LonghubangAgents:
         kline_9d_data: Optional[Dict[str, Any]] = None,
         trend_overlay_scale: float = 1.0,
         fixed_candidate_stocks: Optional[List[Dict[str, Any]]] = None,
+        market_style_context: Optional[Dict[str, Any]] = None,
+        sector_tier_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         风险控制专家 - 识别龙虎榜中的风险信号
@@ -1057,7 +1125,7 @@ class LonghubangAgents:
         self.logger.info("⚠️ 风险控制专家正在分析...")
         time.sleep(1)
         risk_signal_context = self._build_risk_signal_context(
-            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks
+            concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, fixed_candidate_stocks, market_style_context, sector_tier_map
         )
         
         prompt = f"""
@@ -1160,6 +1228,8 @@ class LonghubangAgents:
         recommendation_limit_up_ratio: float = 0.4,
         enable_recommendation_quota: bool = True,
         candidate_quota_context: str = "",
+        market_style_context: Optional[Dict[str, Any]] = None,
+        sector_tier_map: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
         首席策略师 - 综合所有分析师的意见，给出最终投资建议
@@ -1181,7 +1251,7 @@ class LonghubangAgents:
             analyses_text += f"{'='*60}\n"
             analyses_text += analysis['analysis'] + "\n"
         chief_signal_context = self._build_chief_signal_context(
-            summary or {}, concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale
+            summary or {}, concept_rotation_data, limit_step_data, ths_hot_data, kpl_list_data, p1_signal_data, kline_9d_data, trend_overlay_scale, market_style_context, sector_tier_map
         )
         theme_whitelist_context = self._build_theme_whitelist_context(summary or {})
         stock_theme_binding_context = self._build_stock_theme_binding_context(summary or {})
@@ -1321,7 +1391,7 @@ class LonghubangAgents:
 
 【输出硬约束】
 1) 仅输出一个Markdown表格，不要输出任何解释文字。
-2) 表头固定：股票代码 | 推荐理由（详细） | 确定性评级 | 买入时机建议 | 交易触发条件 | 持有周期建议
+2) 表头固定：股票代码 | 推荐理由（详细） | 确定性评级 | 买入时机建议 | 交易触发条件 | 持有周期建议 | 止损思路 | 失效条件
 3) 每只股票必须一行，覆盖全部给定股票代码。
 4) 禁止使用“待定/暂无/N/A/观察”等占位词。
 5) 推荐理由必须是完整句，至少包含：资金面依据 + 题材/逻辑依据 + 次日观察重点（可合并成一段）。

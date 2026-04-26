@@ -317,6 +317,29 @@ class LonghubangEngine:
 
         return round(max(-2.0, min(2.0, adjust)), 2)
 
+    def _calc_weekly_trend_adjust(self, detail: Dict[str, Any]) -> float:
+        """将周线趋势信号映射为极小幅评分修正（限制在[-0.6, 0.6]）。"""
+        if not isinstance(detail, dict):
+            return 0.0
+        stage = str(detail.get("weekly_trend_stage", "") or "").strip()
+        stage_map = {
+            "周线强势": 0.45,
+            "周线偏强": 0.2,
+            "周线震荡": 0.0,
+            "周线偏弱": -0.2,
+            "周线走弱": -0.45,
+        }
+        adjust = float(stage_map.get(stage, 0.0))
+        weekly_change = float(detail.get("weekly_change_pct", 0.0) or 0.0)
+        weekly_streak = int(detail.get("weekly_up_streak", 0) or 0)
+        if weekly_change >= 12.0:
+            adjust += 0.1
+        elif weekly_change <= -10.0:
+            adjust -= 0.1
+        if weekly_streak >= 3:
+            adjust += 0.05
+        return round(max(-0.6, min(0.6, adjust)), 2)
+
     def _apply_9d_kline_overlay(
         self,
         scoring_df,
@@ -349,7 +372,8 @@ class LonghubangEngine:
             if not detail:
                 continue
             adjust = self._calc_9d_trend_adjust(detail) * scale
-            adjust = round(max(-10.0, min(10.0, adjust)), 2)
+            weekly_adjust = self._calc_weekly_trend_adjust(detail) * min(scale, 2.0)
+            adjust = round(max(-10.0, min(10.0, adjust + weekly_adjust)), 2)
             old_score = float(row.get("综合评分", 0.0) or 0.0)
             df.at[idx, "综合评分"] = round(old_score + adjust, 1)
             df.at[idx, "趋势微调"] = round(adjust, 2)
@@ -918,6 +942,16 @@ class LonghubangEngine:
                 },
             )
             results["p1_advanced_signals"] = p1_signal_data
+            market_context = self._derive_market_style_context(
+                concept_rotation_data=concept_rotation_data,
+                limit_step_data=limit_step_data,
+                ths_hot_data=ths_hot_data,
+                kpl_list_data=kpl_list_data,
+                p1_signal_data=p1_signal_data,
+            )
+            sector_tier_map = self._derive_sector_tier_map(concept_candidates)
+            results["lhb_market_style_context"] = market_context
+            results["lhb_sector_tier_map"] = sector_tier_map
 
             results["data_info"] = {
                 "total_records": summary.get('total_records', 0),
@@ -963,6 +997,8 @@ class LonghubangEngine:
                 limit_step_data=limit_step_data,
                 ths_hot_data=ths_hot_data,
                 p1_signal_data=p1_signal_data,
+                market_style_context=market_context,
+                sector_tier_map=sector_tier_map,
             )
             # 阶段3.6: 候选股票9日K线趋势（轻量微调，不改变主评分框架）
             if bool(enable_9d_trend_overlay) and scoring_df is not None and not getattr(scoring_df, "empty", True):
@@ -994,6 +1030,34 @@ class LonghubangEngine:
                 "enabled": bool(enable_9d_trend_overlay),
                 "scale": round(max(0.0, min(float(trend_overlay_scale or 1.0), 10.0)), 2),
             }
+            if isinstance(market_context, dict):
+                market_context = {
+                    **market_context,
+                    **self._derive_market_style_context(
+                        concept_rotation_data=concept_rotation_data,
+                        limit_step_data=limit_step_data,
+                        ths_hot_data=ths_hot_data,
+                        kpl_list_data=kpl_list_data,
+                        p1_signal_data=p1_signal_data,
+                        kline_9d_data=kline_9d_data,
+                    ),
+                }
+            else:
+                market_context = self._derive_market_style_context(
+                    concept_rotation_data=concept_rotation_data,
+                    limit_step_data=limit_step_data,
+                    ths_hot_data=ths_hot_data,
+                    kpl_list_data=kpl_list_data,
+                    p1_signal_data=p1_signal_data,
+                    kline_9d_data=kline_9d_data,
+                )
+            results["lhb_market_style_context"] = market_context
+            self.logger.info(
+                "[阶段3.5] 市场温度=%s | 风格=%s | 热度分=%s",
+                market_context.get("market_temperature", "warm"),
+                market_context.get("style_regime", "balanced"),
+                market_context.get("market_heat_score", 50.0),
+            )
             self.logger.info(
                 f"[阶段3.5] 评分计算结束 | elapsed={round(time.time() - scoring_start, 2)}s"
             )
@@ -1026,6 +1090,12 @@ class LonghubangEngine:
                 mainboard_limit_like_pct=mainboard_limit_up_threshold,
                 max_candidates=80,
                 concept_outlook_map=results.get("concept_outlook_map", {}) or {},
+                cyq_perf_map=self._fetch_cyq_perf_map(
+                    stock_codes=stock_codes,
+                    trade_date=target_trade_date,
+                ),
+                market_style_context=market_context,
+                sector_tier_map=sector_tier_map,
             )
             summary_for_ai = self._ensure_theme_clues_for_candidates(
                 summary=summary_for_ai,
@@ -1105,6 +1175,8 @@ class LonghubangEngine:
                 kline_9d_data=kline_9d_data,
                 trend_overlay_scale=trend_overlay_scale,
                 fixed_candidate_stocks=ai_candidate_stocks,
+                market_style_context=market_context,
+                sector_tier_map=sector_tier_map,
             )
             agents_results["youzi"] = youzi_result
             self.logger.info(f"1/5 游资行为分析师完成 | elapsed={round(time.time() - agent_started, 2)}s")
@@ -1123,6 +1195,8 @@ class LonghubangEngine:
                 kline_9d_data=kline_9d_data,
                 trend_overlay_scale=trend_overlay_scale,
                 fixed_candidate_stocks=ai_candidate_stocks,
+                market_style_context=market_context,
+                sector_tier_map=sector_tier_map,
             )
             agents_results["stock"] = stock_result
             self.logger.info(f"2/5 个股潜力分析师完成 | elapsed={round(time.time() - agent_started, 2)}s")
@@ -1141,6 +1215,8 @@ class LonghubangEngine:
                 kline_9d_data=kline_9d_data,
                 trend_overlay_scale=trend_overlay_scale,
                 fixed_candidate_stocks=ai_candidate_stocks,
+                market_style_context=market_context,
+                sector_tier_map=sector_tier_map,
             )
             agents_results["theme"] = theme_result
             self.logger.info(f"3/5 题材追踪分析师完成 | elapsed={round(time.time() - agent_started, 2)}s")
@@ -1159,6 +1235,8 @@ class LonghubangEngine:
                 kline_9d_data=kline_9d_data,
                 trend_overlay_scale=trend_overlay_scale,
                 fixed_candidate_stocks=ai_candidate_stocks,
+                market_style_context=market_context,
+                sector_tier_map=sector_tier_map,
             )
             agents_results["risk"] = risk_result
             self.logger.info(f"4/5 风险控制专家完成 | elapsed={round(time.time() - agent_started, 2)}s")
@@ -1190,6 +1268,8 @@ class LonghubangEngine:
                     mainboard_limit_like_pct=mainboard_limit_up_threshold,
                     enable_recommendation_quota=bool(enable_recommendation_quota),
                 ),
+                market_style_context=market_context,
+                sector_tier_map=sector_tier_map,
             )
             agents_results["chief"] = chief_result
             chief_quota_check = self._evaluate_chief_quota_alignment(
@@ -1242,6 +1322,14 @@ class LonghubangEngine:
                 recommended_stocks=recommended_stocks,
                 chief_analysis=chief_result.get("analysis", ""),
             )
+            review_snapshot_id = f"{target_trade_date.replace('-', '')}_{int(time.time())}"
+            review_snapshot = self._build_review_snapshot(
+                review_snapshot_id=review_snapshot_id,
+                trade_date=target_trade_date,
+                recommended_stocks=recommended_stocks,
+                market_style_context=market_context,
+            )
+            results["lhb_review_snapshot"] = review_snapshot
             # 若首席表未满足配额：按系统推荐表定向替换缺口数量（而非整表回填）
             quota_patch = self._patch_chief_table_with_recommended_quota(
                 chief_analysis=chief_result.get("analysis", ""),
@@ -1326,6 +1414,9 @@ class LonghubangEngine:
                 "kpl_list_heat": kpl_list_data,
                 "kline_9d_trend": kline_9d_data,
                 "p1_advanced_signals": p1_signal_data,
+                "lhb_market_style_context": results.get("lhb_market_style_context", {}),
+                "lhb_sector_tier_map": results.get("lhb_sector_tier_map", {}),
+                "lhb_review_snapshot": results.get("lhb_review_snapshot", {}),
                 "history_sync": results.get("history_sync", {}),
                 "history_peer_rebound": results.get("history_peer_rebound", {}),
                 "scoring_ranking": scoring_ranking_data,
@@ -1488,6 +1579,12 @@ class LonghubangEngine:
         if "." in text:
             text = text.split(".", 1)[0]
         return text if len(text) == 6 and text.isdigit() else ""
+
+    def _to_ts_code(self, value: Any) -> str:
+        code = self._normalize_code(value)
+        if not code:
+            return ""
+        return f"{code}.SH" if code.startswith("6") else f"{code}.SZ"
 
     def _is_mainboard_code(self, code: str) -> bool:
         """
@@ -1846,19 +1943,45 @@ class LonghubangEngine:
         if not today_list:
             return base
 
+        # 近N日持续性：统计题材在最近交易日中的出现天数占比
+        history_days = max(int(days_hint or 1), 1)
+        daily_theme_presence: Dict[str, int] = defaultdict(int)
+        for day_item in (daily_stats or [])[:history_days]:
+            day_list = day_item.get("top_list_all", []) or day_item.get("top_list", []) or []
+            day_themes = set()
+            for rec in day_list:
+                for t in (rec.get("themes", []) or []):
+                    clean = str(t or "").strip()
+                    if clean and (not self._is_st_theme(clean)):
+                        day_themes.add(clean)
+            for theme in day_themes:
+                daily_theme_presence[theme] += 1
+
         theme_counter: Counter = Counter()
         theme_chg_sum = defaultdict(float)
         theme_chg_cnt = Counter()
         theme_chg_sq_sum = defaultdict(float)
+        theme_streak_sum = defaultdict(float)
+        theme_streak_cnt = Counter()
         theme_best_rank = {}
         theme_top20_hits = Counter()
         stock_concept_map: Dict[str, List[str]] = {}
 
         for row in today_list:
             code = self._normalize_code(row.get("code", ""))
+            detail = stock_kpl_map.get(code, {}) if code else {}
             themes = row.get("themes", []) or []
-            change_pct = float(row.get("change_pct", 0.0) or 0.0)
+            if (not themes) and isinstance(detail, dict):
+                themes = detail.get("themes", []) or []
+            raw_change_pct = row.get("change_pct", row.get("pct_chg", row.get("pct", 0.0)))
+            change_pct = self._safe_float_num(raw_change_pct)
+            if abs(change_pct) < 1e-9 and isinstance(detail, dict):
+                change_pct = self._safe_float_num(detail.get("avg_chg", 0.0))
             rank = int(row.get("rank", 9999) or 9999)
+            status_text = str(row.get("status", "") or "").strip()
+            if (not status_text) and isinstance(detail, dict):
+                status_text = str(detail.get("status", "") or "").strip()
+            streak = self._parse_streak(status_text)
             for theme in themes:
                 clean = str(theme or "").strip()
                 if not clean or self._is_st_theme(clean):
@@ -1867,6 +1990,9 @@ class LonghubangEngine:
                 theme_chg_sum[clean] += change_pct
                 theme_chg_cnt[clean] += 1
                 theme_chg_sq_sum[clean] += change_pct * change_pct
+                if streak > 0:
+                    theme_streak_sum[clean] += streak
+                    theme_streak_cnt[clean] += 1
                 old_best = int(theme_best_rank.get(clean, 9999) or 9999)
                 if rank < old_best:
                     theme_best_rank[clean] = rank
@@ -1914,29 +2040,18 @@ class LonghubangEngine:
         for theme, cnt in theme_counter.items():
             count = int(cnt)
             avg_pct = float(theme_chg_sum.get(theme, 0.0) or 0.0) / max(int(theme_chg_cnt.get(theme, 0) or 0), 1)
+            avg_streak = float(theme_streak_sum.get(theme, 0.0) or 0.0) / max(int(theme_streak_cnt.get(theme, 0) or 0), 1)
             best_rank = int(theme_best_rank.get(theme, 9999) or 9999)
             top20_hits = int(theme_top20_hits.get(theme, 0) or 0)
             std_pct = float(tmp_std_map.get(theme, 0.0) or 0.0)
 
-            # 1) breadth: 出现广度
-            breadth = count / max(total_rows, 1)
-            # 2) momentum: 板块内平均涨跌幅（截断后归一化）
-            clipped_pct = max(min(avg_pct, 10.0), -5.0)
-            momentum_norm = (clipped_pct + 5.0) / 15.0
-            # 3) head_strength: 龙头位置（rank越小越强）
-            head_strength = max(0.0, 1.0 - (best_rank - 1) / 50.0)
-            # 4) concentration: 前20集中度
-            concentration = top20_hits / max(max_top20, 1)
-            # 5) dispersion_penalty: 分化惩罚（波动越大越扣分）
-            dispersion_penalty = 0.0 if max_std <= 0 else std_pct / max_std
-
-            strength_100 = (
-                35.0 * breadth
-                + 25.0 * momentum_norm
-                + 20.0 * head_strength
-                + 15.0 * concentration
-                - 10.0 * dispersion_penalty
-            )
+            # 三因子口径：出现次数 + 平均涨跌幅 + 连板高度
+            count_norm = count / max(max_count, 1)
+            clipped_pct = max(min(avg_pct, 10.0), -10.0)
+            momentum_norm = (clipped_pct + 10.0) / 20.0
+            streak_norm = min(max(avg_streak, 0.0) / 5.0, 1.0)
+            base_strength = 65.0 * count_norm + 35.0 * momentum_norm
+            strength_100 = (1.0 - 0.15) * base_strength + 0.15 * (streak_norm * 100.0)
             strength_100 = max(0.0, min(strength_100, 100.0))
 
             theme_rows.append(
@@ -1944,9 +2059,16 @@ class LonghubangEngine:
                     "concept": theme,
                     "count": count,
                     "pct_chg": round(avg_pct, 2),
+                    "avg_streak": round(avg_streak, 2),
+                    "streak_norm": round(streak_norm, 4),
                     "best_rank": best_rank,
                     "top20_hits": top20_hits,
                     "std_pct": round(std_pct, 3),
+                    "persistence_days": int(daily_theme_presence.get(theme, 0) or 0),
+                    "persistence_ratio": round(
+                        (int(daily_theme_presence.get(theme, 0) or 0) / max(history_days, 1)),
+                        3,
+                    ),
                     "strength_100": round(strength_100, 2),
                 }
             )
@@ -1957,11 +2079,24 @@ class LonghubangEngine:
         )
         top10 = theme_rows[:10]
 
-        max_strength = max([float(x["strength_100"]) for x in top10] + [1.0])
+        strength_values_all = [float(x.get("strength_100", 0.0) or 0.0) for x in theme_rows]
         concept_strength_map: Dict[str, float] = {}
         for item in top10:
-            score = min((float(item["strength_100"]) / max_strength) * 4.0, 4.0)
-            concept_strength_map[item["concept"]] = round(score, 2)
+            concept = str(item.get("concept", "") or "").strip()
+            if not concept:
+                continue
+            score = self._score_theme_strength_4(
+                strength_100=float(item.get("strength_100", 0.0) or 0.0),
+                percentile_rank=self._percentile_rank(
+                    strength_values_all,
+                    float(item.get("strength_100", 0.0) or 0.0),
+                ),
+                sample_count=int(item.get("count", 0) or 0),
+                sample_cap=max_count,
+                consistency=1.0,
+                stability=1.0,
+            )
+            concept_strength_map[concept] = score
 
         strongest = top10[0]
         trade_date = str(today.get("trade_date") or "")
@@ -1974,9 +2109,13 @@ class LonghubangEngine:
                         "score": concept_strength_map.get(x["concept"], 0.0),
                         "count": x["count"],
                         "pct_chg": x["pct_chg"],
+                        "avg_streak": float(x.get("avg_streak", 0.0) or 0.0),
+                        "streak_norm": float(x.get("streak_norm", 0.0) or 0.0),
                         "best_rank": x["best_rank"],
                         "top20_hits": x["top20_hits"],
                         "strength_100": x["strength_100"],
+                        "persistence_days": int(x.get("persistence_days", 0) or 0),
+                        "persistence_ratio": float(x.get("persistence_ratio", 0.0) or 0.0),
                     }
                     for x in top10
                 ],
@@ -2004,6 +2143,8 @@ class LonghubangEngine:
                     "hot_num_total": int(strongest["count"]),
                     "hot_num_avg": round(float(strongest["count"]), 2),
                     "pct_chg": strongest["pct_chg"],
+                    "avg_streak": float(strongest.get("avg_streak", 0.0) or 0.0),
+                    "streak_norm": float(strongest.get("streak_norm", 0.0) or 0.0),
                     "best_rank": strongest["best_rank"],
                     "strength_100": strongest["strength_100"],
                 },
@@ -2025,8 +2166,12 @@ class LonghubangEngine:
                             "days_as_top": int(x["count"]),
                             "hot_num_total": float(x["count"]),
                             "pct_chg": x["pct_chg"],
+                            "avg_streak": float(x.get("avg_streak", 0.0) or 0.0),
+                            "streak_norm": float(x.get("streak_norm", 0.0) or 0.0),
                             "best_rank": x["best_rank"],
                             "strength_100": x["strength_100"],
+                            "persistence_days": int(x.get("persistence_days", 0) or 0),
+                            "persistence_ratio": float(x.get("persistence_ratio", 0.0) or 0.0),
                         }
                         for x in top10[:5]
                     ],
@@ -2034,6 +2179,11 @@ class LonghubangEngine:
                         f"{x['concept']}({concept_strength_map.get(x['concept'], 0.0)})"
                         for x in top10[:5]
                     ],
+                    "avg_persistence_ratio_top5": round(
+                        sum(float(x.get("persistence_ratio", 0.0) or 0.0) for x in top10[:5])
+                        / max(len(top10[:5]), 1),
+                        3,
+                    ),
                     "capital_flow_signal": flow_signal,
                     "strongest_concept": strongest["concept"],
                     "strongest_count": int(strongest["count"]),
@@ -2049,8 +2199,12 @@ class LonghubangEngine:
                         "hot_num_total": int(x["count"]),
                         "hot_num_avg": round(float(x["count"]), 2),
                         "pct_chg": x["pct_chg"],
+                        "avg_streak": float(x.get("avg_streak", 0.0) or 0.0),
+                        "streak_norm": float(x.get("streak_norm", 0.0) or 0.0),
                         "best_rank": x["best_rank"],
                         "strength_100": x["strength_100"],
+                        "persistence_days": int(x.get("persistence_days", 0) or 0),
+                        "persistence_ratio": float(x.get("persistence_ratio", 0.0) or 0.0),
                     }
                     for x in top10
                 ],
@@ -2158,28 +2312,43 @@ class LonghubangEngine:
         for theme, cnt in theme_counter.items():
             avg_pct = float(theme_pct_sum[theme]) / max(int(theme_pct_cnt[theme]), 1)
             avg_streak = float(theme_streak_sum[theme]) / max(int(theme_streak_cnt[theme]), 1)
-            breadth = int(cnt) / max(total_stock, 1)
-            momentum = (max(min(avg_pct, 10.0), -5.0) + 5.0) / 15.0
-            streak_norm = min(avg_streak / max(max_streak, 1e-6), 1.0)
+            # 三因子口径：出现次数 + 平均涨跌幅 + 连板高度
             count_norm = int(cnt) / max(max_count, 1)
-            strength_100 = 40.0 * breadth + 30.0 * momentum + 20.0 * streak_norm + 10.0 * count_norm
+            clipped_pct = max(min(avg_pct, 10.0), -10.0)
+            momentum_norm = (clipped_pct + 10.0) / 20.0
+            streak_norm = min(max(avg_streak, 0.0) / 5.0, 1.0)
+            base_strength = 65.0 * count_norm + 35.0 * momentum_norm
+            strength_100 = (1.0 - 0.15) * base_strength + 0.15 * (streak_norm * 100.0)
             theme_rows.append(
                 {
                     "concept": theme,
                     "count": int(cnt),
                     "pct_chg": round(avg_pct, 2),
                     "avg_streak": round(avg_streak, 2),
+                    "streak_norm": round(streak_norm, 4),
                     "strength_100": round(max(0.0, min(strength_100, 100.0)), 2),
                 }
             )
         theme_rows.sort(key=lambda x: (x["strength_100"], x["count"], x["pct_chg"]), reverse=True)
         top10 = theme_rows[:10]
 
-        max_strength = max([float(x["strength_100"]) for x in top10] + [1.0])
-        concept_strength_map = {
-            x["concept"]: round(min(float(x["strength_100"]) / max_strength * 4.0, 4.0), 2)
-            for x in top10
-        }
+        strength_values_all = [float(x.get("strength_100", 0.0) or 0.0) for x in theme_rows]
+        concept_strength_map = {}
+        for x in top10:
+            concept = str(x.get("concept", "") or "").strip()
+            if not concept:
+                continue
+            concept_strength_map[concept] = self._score_theme_strength_4(
+                strength_100=float(x.get("strength_100", 0.0) or 0.0),
+                percentile_rank=self._percentile_rank(
+                    strength_values_all,
+                    float(x.get("strength_100", 0.0) or 0.0),
+                ),
+                sample_count=int(x.get("count", 0) or 0),
+                sample_cap=max_count,
+                consistency=1.0,
+                stability=1.0,
+            )
         strongest = top10[0]
         fmt_trade_date = f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
 
@@ -2205,6 +2374,7 @@ class LonghubangEngine:
                                 "count": x["count"],
                                 "pct_chg": x["pct_chg"],
                                 "avg_streak": x["avg_streak"],
+                                "streak_norm": float(x.get("streak_norm", 0.0) or 0.0),
                                 "strength_100": x["strength_100"],
                             }
                             for x in top10
@@ -2227,6 +2397,8 @@ class LonghubangEngine:
                             "days_as_top": int(x["count"]),
                             "hot_num_total": float(x["count"]),
                             "pct_chg": x["pct_chg"],
+                            "avg_streak": float(x.get("avg_streak", 0.0) or 0.0),
+                            "streak_norm": float(x.get("streak_norm", 0.0) or 0.0),
                             "strength_100": x["strength_100"],
                         }
                         for x in top10[:5]
@@ -2292,6 +2464,42 @@ class LonghubangEngine:
             return 0.75
         return 0.0
 
+    def _percentile_rank(self, values: List[float], value: float) -> float:
+        nums = [float(v) for v in (values or []) if v is not None]
+        if not nums:
+            return 0.5
+        if len(nums) == 1:
+            return 1.0
+        less_or_equal = sum(1 for x in nums if x <= value)
+        return max(0.0, min(1.0, (less_or_equal - 1) / (len(nums) - 1)))
+
+    def _score_theme_strength_4(
+        self,
+        *,
+        strength_100: float,
+        percentile_rank: float,
+        sample_count: int,
+        sample_cap: int,
+        consistency: float = 0.0,
+        stability: float = 1.0,
+    ) -> float:
+        s100 = max(0.0, min(100.0, float(strength_100 or 0.0)))
+        pr = max(0.0, min(1.0, float(percentile_rank or 0.0)))
+        sc = max(0, int(sample_count or 0))
+        cap = max(1, int(sample_cap or 1))
+        cons = max(0.0, min(1.0, float(consistency or 0.0)))
+        stab = max(0.0, min(1.0, float(stability or 0.0)))
+
+        abs_part = s100 / 100.0 * 2.6
+        pct_part = pr * 1.4
+        sample_ratio = min(sc / cap, 1.0)
+        sample_factor = 0.65 + 0.35 * (sample_ratio ** 0.5)
+        consistency_factor = 0.8 + 0.2 * cons
+        stability_factor = 0.85 + 0.15 * stab
+
+        score = (abs_part + pct_part) * sample_factor * consistency_factor * stability_factor
+        return round(max(0.0, min(score, 4.0)), 2)
+
     def _build_concept_rotation_fusion(
         self,
         kpl_list_data: Dict[str, Any],
@@ -2330,6 +2538,16 @@ class LonghubangEngine:
         kpl_stock_map = kpl_rotation.get("stock_concept_map", {}) or {}
         limit_stock_map = limit_rotation.get("stock_concept_map", {}) or {}
         limit_strength100_map = self._extract_rotation_strength100_map(limit_rotation)
+        limit_pct_map: Dict[str, float] = {}
+        limit_daily_rankings = limit_rotation.get("daily_rankings", []) or []
+        limit_top_concepts = (limit_daily_rankings[0] or {}).get("top_concepts", []) if limit_daily_rankings else []
+        if not limit_top_concepts:
+            limit_top_concepts = limit_rotation.get("board_top10", []) or []
+        for item in limit_top_concepts:
+            limit_concept = str(item.get("concept", "") or "").strip()
+            if not limit_concept:
+                continue
+            limit_pct_map[limit_concept] = float(item.get("pct_chg", 0.0) or 0.0)
 
         concept_to_codes = defaultdict(set)
         for code, concepts in kpl_stock_map.items():
@@ -2353,6 +2571,8 @@ class LonghubangEngine:
             limit_theme_counter = Counter()
             lu_strength_hit_sum = 0.0
             lu_strength_hit_cnt = 0
+            lu_pct_hit_sum = 0.0
+            lu_pct_hit_w = 0.0
 
             for code in codes:
                 themes = limit_stock_map.get(code, []) or []
@@ -2365,6 +2585,7 @@ class LonghubangEngine:
                         continue
                     limit_theme_counter[clean] += 1
                     best_match = 0.0
+                    best_pct = 0.0
                     for limit_theme, strength100 in limit_strength100_map.items():
                         match = self._concept_match_score(clean, limit_theme)
                         if match <= 0:
@@ -2372,22 +2593,36 @@ class LonghubangEngine:
                         matched_strength = match * (float(strength100) / 100.0)
                         if matched_strength > best_match:
                             best_match = matched_strength
+                            best_pct = float(limit_pct_map.get(limit_theme, 0.0) or 0.0)
                     if best_match > 0:
                         lu_strength_hit_sum += best_match
                         lu_strength_hit_cnt += 1
+                        lu_pct_hit_sum += best_match * best_pct
+                        lu_pct_hit_w += best_match
 
             coverage = hit_codes / max(len(codes), 1)
             lu_strength_norm = lu_strength_hit_sum / max(lu_strength_hit_cnt, 1)
-            lu_boost_100 = 100.0 * (0.6 * coverage + 0.4 * lu_strength_norm)
-            fused_strength = max(0.0, min(100.0, 0.7 * kpl_strength + 0.3 * lu_boost_100))
+            lu_pct = lu_pct_hit_sum / max(lu_pct_hit_w, 1e-9)
+            kpl_pct = float(row.get("pct_chg", 0.0) or 0.0)
+            if abs(kpl_pct) < 1e-9 and abs(lu_pct) > 1e-9:
+                fused_pct = lu_pct
+            elif abs(lu_pct) < 1e-9:
+                fused_pct = kpl_pct
+            else:
+                fused_pct = 0.6 * kpl_pct + 0.4 * lu_pct
+            kpl_norm = max(0.0, min(kpl_strength / 100.0, 1.0))
+            lu_norm = max(0.0, min(lu_strength_norm, 1.0))
+            fused_norm = 0.65 * kpl_norm + 0.35 * lu_norm
+            fused_strength = max(0.0, min(fused_norm * 100.0, 100.0))
 
             top_lu_tags = [x[0] for x in limit_theme_counter.most_common(3)]
             fused_rows.append(
                 {
                     **row,
+                    "pct_chg": round(float(fused_pct), 2),
                     "kpl_strength_100": round(kpl_strength, 2),
                     "lu_desc_coverage": round(coverage, 2),
-                    "lu_desc_boost_100": round(lu_boost_100, 2),
+                    "lu_desc_boost_100": round(lu_norm * 100.0, 2),
                     "lu_desc_top3": top_lu_tags,
                     "strength_100": round(fused_strength, 2),
                 }
@@ -2406,14 +2641,25 @@ class LonghubangEngine:
         )
         top10 = fused_rows[:10]
         strongest = top10[0]
-        max_strength = max([float(x.get("strength_100", 0.0) or 0.0) for x in top10] + [1.0])
-        fused_strength_map = {
-            str(x.get("concept")): round(
-                min(float(x.get("strength_100", 0.0) or 0.0) / max_strength * 4.0, 4.0), 2
+        fused_strength_values_all = [float(x.get("strength_100", 0.0) or 0.0) for x in fused_rows]
+        fused_strength_map = {}
+        for x in top10:
+            concept = str(x.get("concept", "") or "").strip()
+            if not concept:
+                continue
+            # 覆盖率越高表示跨源一致性越强，小样本题材不过度放大
+            coverage = float(x.get("lu_desc_coverage", 0.0) or 0.0)
+            fused_strength_map[concept] = self._score_theme_strength_4(
+                strength_100=float(x.get("strength_100", 0.0) or 0.0),
+                percentile_rank=self._percentile_rank(
+                    fused_strength_values_all,
+                    float(x.get("strength_100", 0.0) or 0.0),
+                ),
+                sample_count=int(x.get("count", 0) or 0),
+                sample_cap=max(len(kpl_stock_map), 1),
+                consistency=coverage,
+                stability=coverage,
             )
-            for x in top10
-            if str(x.get("concept") or "").strip()
-        }
 
         merged = dict(kpl_rotation)
         merged["source"] = "tushare.kpl_list+limit_list_ths"
@@ -2472,7 +2718,7 @@ class LonghubangEngine:
             {
                 "concept_source": "kpl_list+limit_list_ths",
                 "fusion_enabled": True,
-                "fusion_weights": {"kpl_strength": 0.7, "lu_desc_enhance": 0.3},
+                "fusion_weights": {"kpl_strength": 0.65, "lu_desc_enhance": 0.35},
                 "leading_concepts": [
                     {
                         "concept": x.get("concept", ""),
@@ -2647,6 +2893,7 @@ class LonghubangEngine:
         if not isinstance(concept_rotation_data, dict) or not concept_rotation_data.get("data_success"):
             return []
         source = str(concept_rotation_data.get("concept_source", "") or "").strip()
+        concept_strength_map = dict(concept_rotation_data.get("concept_strength_map", {}) or {})
         rows = []
         daily_rankings = concept_rotation_data.get("daily_rankings", []) or []
         top_concepts = []
@@ -2662,9 +2909,12 @@ class LonghubangEngine:
                 {
                     "rank": idx,
                     "concept": concept,
+                    "strength_score": round(float(concept_strength_map.get(concept, item.get("score", 0.0)) or 0.0), 2),
                     "strength_100": round(float(item.get("strength_100", 0.0) or 0.0), 2),
                     "count": int(item.get("count", item.get("stock_count", 0)) or 0),
                     "pct_chg": round(float(item.get("pct_chg", 0.0) or 0.0), 2),
+                    "avg_streak": round(float(item.get("avg_streak", 0.0) or 0.0), 2),
+                    "streak_norm": round(float(item.get("streak_norm", 0.0) or 0.0), 4),
                     "source": source,
                 }
             )
@@ -2710,6 +2960,7 @@ class LonghubangEngine:
                 candidate_key_map[key] = {
                     "concept": concept,
                     "strength_100": float((row or {}).get("strength_100", 0.0) or 0.0),
+                    "strength_score": float((row or {}).get("strength_score", 0.0) or 0.0),
                 }
 
         max_base = max([float(v or 0.0) for v in base_map.values()] or [1.0])
@@ -2725,7 +2976,10 @@ class LonghubangEngine:
                 concept = str(candidate_meta.get("concept", "") or "").strip()
                 if concept:
                     s100 = max(0.0, min(100.0, float(candidate_meta.get("strength_100", 0.0) or 0.0)))
-                    mapped = max_base * (s100 / 100.0)
+                    candidate_score = max(0.0, min(4.0, float(candidate_meta.get("strength_score", 0.0) or 0.0)))
+                    mapped_from_100 = max_base * (s100 / 100.0)
+                    mapped_from_score = max_base * (candidate_score / 4.0)
+                    mapped = max(mapped_from_100, mapped_from_score)
                     base_val = max(min_base, mapped)
             if not concept or base_val is None:
                 continue
@@ -2772,7 +3026,7 @@ class LonghubangEngine:
             if key not in normalized_input:
                 continue
             u = normalized_input[key] / 2.0
-            s1 = max(0.0, min(1.0, float(row.get("strength_100", 0.0) or 0.0) / 100.0))
+            s1 = max(0.0, min(1.0, float(row.get("strength_score", 0.0) or 0.0) / 4.0))
             s2 = max(-1.0, min(1.0, float(row.get("pct_chg", 0.0) or 0.0) / 6.0))
             cnt = int(row.get("count", 0) or 0)
             s3 = max(-1.0, min(1.0, (cnt - median_base) / float(median_base)))
@@ -2891,6 +3145,258 @@ class LonghubangEngine:
             return float(m.group())
         except Exception:
             return 0.0
+
+    def _derive_market_style_context(
+        self,
+        concept_rotation_data: Optional[Dict[str, Any]] = None,
+        limit_step_data: Optional[Dict[str, Any]] = None,
+        ths_hot_data: Optional[Dict[str, Any]] = None,
+        kpl_list_data: Optional[Dict[str, Any]] = None,
+        p1_signal_data: Optional[Dict[str, Any]] = None,
+        kline_9d_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        heat_score = 50.0
+        step_summary = (limit_step_data or {}).get("market_heat_summary", {}) or {}
+        hot_summary = (ths_hot_data or {}).get("hot_summary", {}) or {}
+        kpl_summary = (kpl_list_data or {}).get("kpl_summary", {}) or {}
+        money_summary = (p1_signal_data or {}).get("moneyflow_summary", {}) or {}
+        trend_summary = (kline_9d_data or {}).get("trend_summary", {}) or {}
+
+        avg_max_step = float(step_summary.get("avg_max_step", 0.0) or 0.0)
+        if avg_max_step >= 5:
+            heat_score += 12
+        elif avg_max_step >= 3:
+            heat_score += 6
+        elif avg_max_step <= 1.5:
+            heat_score -= 6
+
+        positive_ratio = float(money_summary.get("positive_ratio", 0.0) or 0.0)
+        heat_score += max(-8.0, min(8.0, (positive_ratio - 0.5) * 20.0))
+
+        tracked_hot = int(hot_summary.get("tracked_stocks", 0) or 0)
+        tracked_kpl = int(kpl_summary.get("tracked_stocks", 0) or 0)
+        if tracked_hot >= 120:
+            heat_score += 4
+        if tracked_kpl >= 120:
+            heat_score += 4
+
+        decline_count = int(trend_summary.get("decline_count", 0) or 0)
+        high_shake_count = int(trend_summary.get("high_shake_count", 0) or 0)
+        tracked_trend = int(trend_summary.get("tracked_stocks", 0) or 0)
+        if tracked_trend > 0:
+            risk_ratio = (decline_count + high_shake_count) / max(1, tracked_trend)
+            heat_score -= max(0.0, min(12.0, risk_ratio * 12.0))
+
+        heat_score = max(0.0, min(100.0, heat_score))
+        if heat_score >= 68:
+            market_temperature = "hot"
+        elif heat_score >= 42:
+            market_temperature = "warm"
+        else:
+            market_temperature = "cold"
+
+        if market_temperature == "hot" and positive_ratio >= 0.52:
+            style_regime = "risk_on"
+        elif market_temperature == "cold" or positive_ratio < 0.42:
+            style_regime = "defensive"
+        else:
+            style_regime = "balanced"
+
+        return {
+            "market_heat_score": round(heat_score, 2),
+            "market_temperature": market_temperature,
+            "style_regime": style_regime,
+            "style_confidence": round(min(1.0, abs(heat_score - 50.0) / 50.0), 3),
+            "components": {
+                "avg_max_step": round(avg_max_step, 3),
+                "money_positive_ratio": round(positive_ratio, 3),
+                "hot_tracked_stocks": tracked_hot,
+                "kpl_tracked_stocks": tracked_kpl,
+                "decline_count": decline_count,
+                "high_shake_count": high_shake_count,
+            },
+        }
+
+    def _derive_sector_tier_map(self, concept_candidates: Optional[List[Dict[str, Any]]]) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        rows = list(concept_candidates or [])
+        if not rows:
+            return out
+        for idx, item in enumerate(rows[:20]):
+            theme = str(item.get("concept", "") or "").strip()
+            if not theme:
+                continue
+            key = self._normalize_theme_match_key(theme)
+            if not key:
+                continue
+            if idx < 3:
+                tier = "mainline"
+            elif idx < 7:
+                tier = "secondary"
+            elif idx < 12:
+                tier = "rotation"
+            else:
+                tier = "fading"
+            out[key] = tier
+        return out
+
+    def _resolve_sector_tier(self, theme_tokens: List[str], sector_tier_map: Dict[str, str]) -> str:
+        if not theme_tokens or not sector_tier_map:
+            return "rotation"
+        rank = {"mainline": 4, "secondary": 3, "rotation": 2, "fading": 1}
+        best_tier = "rotation"
+        best_score = 0
+        for token in (theme_tokens or []):
+            key = self._normalize_theme_match_key(token)
+            tier = str(sector_tier_map.get(key, "") or "")
+            s = rank.get(tier, 0)
+            if s > best_score:
+                best_score = s
+                best_tier = tier
+        return best_tier
+
+    def _derive_stock_position_tag(self, trend: Dict[str, Any], limit_up_streak: int = 0) -> str:
+        stage = str((trend or {}).get("trend_stage", "") or "").strip()
+        change_7d = float((trend or {}).get("change_7d_pct", 0.0) or 0.0)
+        drawdown = float((trend or {}).get("drawdown_from_high_pct", 0.0) or 0.0)
+        if limit_up_streak >= 3 or "强势" in stage:
+            return "mid_accel" if drawdown <= 9.0 else "high_divergence"
+        if "退潮" in stage or change_7d < -6.0:
+            return "fading"
+        if "高位" in stage or drawdown > 14.0:
+            return "high_divergence"
+        return "low_start"
+
+    def _derive_capital_behavior_tag(
+        self,
+        p1: Dict[str, Any],
+        net_inflow: float,
+        limit_quality_score: float,
+    ) -> str:
+        p1d = dict(p1 or {})
+        inst_net = float(p1d.get("inst_net_amt", 0.0) or 0.0)
+        youzi_net = float(p1d.get("youzi_net_amt_sum", 0.0) or 0.0)
+        main_net = float(p1d.get("main_net_amt_sum", 0.0) or 0.0)
+        if inst_net > 0 and inst_net >= abs(youzi_net) * 0.8:
+            return "institutional_led"
+        if youzi_net > 0 and youzi_net >= abs(inst_net) * 0.8:
+            return "hot_money_led"
+        if (main_net < 0 and youzi_net < 0) or (net_inflow < 0 and limit_quality_score < 0.35):
+            return "distribution_pressure"
+        return "mixed"
+
+    def _build_review_snapshot(
+        self,
+        review_snapshot_id: str,
+        trade_date: str,
+        recommended_stocks: List[Dict[str, Any]],
+        market_style_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        rows = []
+        for item in (recommended_stocks or []):
+            code = self._normalize_code(item.get("code", ""))
+            if not code:
+                continue
+            rows.append(
+                {
+                    "code": code,
+                    "name": str(item.get("name", "") or ""),
+                    "rank": int(item.get("rank", 0) or 0),
+                    "predicted_confidence": str(item.get("confidence", "中") or "中"),
+                    "trade_trigger": str(item.get("lhb_trade_trigger", item.get("target_price", "")) or ""),
+                    "trade_stop_loss": str(item.get("lhb_trade_stop_loss", item.get("stop_loss", "")) or ""),
+                    "trade_invalidation": str(item.get("lhb_trade_invalidation", "") or ""),
+                    "holding_observation": str(item.get("lhb_holding_observation", "") or ""),
+                    "next_day_return": None,
+                    "next_day_hit": None,
+                    "deviation_reason_tag": "",
+                }
+            )
+        return {
+            "lhb_review_snapshot_id": str(review_snapshot_id or ""),
+            "trade_date": str(trade_date or ""),
+            "market_style_context": dict(market_style_context or {}),
+            "predictions": rows,
+        }
+
+    def _evaluate_next_day_outcome(
+        self,
+        review_snapshot: Dict[str, Any],
+        next_day_data: Dict[str, Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        out = dict(review_snapshot or {})
+        predictions = []
+        for row in (out.get("predictions", []) or []):
+            item = dict(row or {})
+            code = self._normalize_code(item.get("code", ""))
+            mkt = dict((next_day_data or {}).get(code, {}) or {})
+            ret = mkt.get("next_day_return", None)
+            try:
+                ret_val = None if ret is None else float(ret)
+            except Exception:
+                ret_val = None
+            item["next_day_return"] = ret_val
+            if ret_val is None:
+                item["next_day_hit"] = None
+                item["deviation_reason_tag"] = ""
+            else:
+                item["next_day_hit"] = bool(ret_val > 0)
+                item["deviation_reason_tag"] = "" if ret_val > 0 else "market_mismatch"
+            predictions.append(item)
+        out["predictions"] = predictions
+        return out
+
+    def _fetch_cyq_perf_map(
+        self,
+        stock_codes: List[str],
+        trade_date: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        pro = data_source_manager.tushare_api
+        if (
+            not data_source_manager.tushare_available
+            or pro is None
+            or not hasattr(pro, "cyq_perf")
+        ):
+            return out
+
+        d8 = self._to_compact_trade_date(trade_date)
+        if not d8:
+            return out
+
+        for code in (stock_codes or []):
+            ts_code = self._to_ts_code(code)
+            if not ts_code:
+                continue
+            try:
+                df = call_tushare_with_timeout(
+                    api_callable=lambda t=ts_code: pro.cyq_perf(ts_code=t, trade_date=d8),
+                    timeout_sec=20,
+                    api_name="cyq_perf",
+                )
+            except Exception:
+                continue
+            if df is None or getattr(df, "empty", True):
+                continue
+
+            row = df.iloc[0]
+            winner_rate = self._safe_float_num(row.get("winner_rate"))
+            cost_50 = self._safe_float_num(row.get("cost_50pct"))
+            weight_avg = self._safe_float_num(row.get("weight_avg"))
+            out[code] = {
+                "winner_rate": round(float(winner_rate), 4),
+                "cost_50pct": round(float(cost_50), 3),
+                "weight_avg": round(float(weight_avg), 3),
+            }
+        return out
+
+    def _calc_cyq_adjust(self, cyq_detail: Dict[str, Any]) -> float:
+        """筹码因子极小幅修正，限制在[-0.5, 0.5]。"""
+        if not isinstance(cyq_detail, dict):
+            return 0.0
+        winner_rate = float(cyq_detail.get("winner_rate", 0.0) or 0.0)
+        adjust = (winner_rate - 0.5) * 1.0
+        return round(max(-0.5, min(0.5, adjust)), 3)
 
     def _get_pct_source_rank(self, row: Dict[str, Any]) -> int:
         """
@@ -3407,7 +3913,7 @@ class LonghubangEngine:
     def _extract_advice_map_from_markdown(self, markdown_text: str) -> Dict[str, Dict[str, str]]:
         """
         解析“建议字段补全器”返回的Markdown表：
-        股票代码 | 推荐理由（详细） | 确定性评级 | 买入时机建议 | 交易触发条件 | 持有周期建议
+        股票代码 | 推荐理由（详细） | 确定性评级 | 买入时机建议 | 交易触发条件 | 持有周期建议 | 止损思路 | 失效条件
         """
         out: Dict[str, Dict[str, str]] = {}
         lines = str(markdown_text or "").splitlines()
@@ -3420,11 +3926,18 @@ class LonghubangEngine:
                 continue
             if "股票代码" in s or s.startswith("|---"):
                 continue
-            # 允许带序号列（7列）或不带序号列（6列）
-            if len(cells) >= 7 and cells[0].isdigit():
-                code_raw, reason, conf, buy_t, trig, hold = cells[1], cells[2], cells[3], cells[4], cells[5], cells[6]
+            # 允许带序号列（9列）或不带序号列（8列）
+            if len(cells) >= 9 and cells[0].isdigit():
+                code_raw, reason, conf, buy_t, trig, hold, stop_loss, invalidation = cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7], cells[8]
+            elif len(cells) >= 8:
+                code_raw, reason, conf, buy_t, trig, hold, stop_loss, invalidation = cells[0], cells[1], cells[2], cells[3], cells[4], cells[5], cells[6], cells[7]
             else:
-                code_raw, reason, conf, buy_t, trig, hold = cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]
+                # 兼容旧版
+                if len(cells) >= 7 and cells[0].isdigit():
+                    code_raw, reason, conf, buy_t, trig, hold = cells[1], cells[2], cells[3], cells[4], cells[5], cells[6]
+                else:
+                    code_raw, reason, conf, buy_t, trig, hold = cells[0], cells[1], cells[2], cells[3], cells[4], cells[5]
+                stop_loss, invalidation = "", ""
             code = self._normalize_code(code_raw)
             if not code:
                 continue
@@ -3434,6 +3947,8 @@ class LonghubangEngine:
                 "buy_price": str(buy_t or "").strip(),
                 "target_price": str(trig or "").strip(),
                 "hold_period": str(hold or "").strip(),
+                "stop_loss": str(stop_loss or "").strip(),
+                "invalidation": str(invalidation or "").strip(),
             }
         return out
 
@@ -3447,8 +3962,12 @@ class LonghubangEngine:
         allowed_keys = {
             "code", "name", "net_inflow", "pct_chg",
             "is_today_limit_up", "is_limit_like_for_quota",
+            "limit_up_status", "limit_up_streak",
             "limit_quality_score", "p1_score", "theme_tokens",
+            "lhb_market_temperature", "lhb_style_regime", "lhb_sector_tier",
+            "lhb_position_tag", "lhb_capital_behavior_tag",
             "concept_user_bias", "concept_outlook_tag", "concept_outlook_hits",
+            "cyq_winner_rate", "cyq_cost_50pct", "cyq_weight_avg", "cyq_adjust",
             "kline_trend_stage", "kline_change_7d_pct", "kline_latest_change_pct",
             "kline_drawdown_from_high_pct", "kline_vol_ratio",
             "data_completeness", "signal_consistency", "data_quality_grade",
@@ -3582,6 +4101,9 @@ class LonghubangEngine:
         mainboard_limit_like_pct: float = 6.0,
         max_candidates: int = 80,
         concept_outlook_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        cyq_perf_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        market_style_context: Optional[Dict[str, Any]] = None,
+        sector_tier_map: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         构建“推荐候选股票池”：
@@ -3597,6 +4119,15 @@ class LonghubangEngine:
         clue_map = self._build_theme_clue_map_from_summary(summary_for_ai or summary or {})
         source_ready = dict(source_completeness or {})
         outlook_map_raw = dict(concept_outlook_map or {})
+        cyq_map = dict(cyq_perf_map or {})
+        market_ctx = dict(market_style_context or {})
+        market_temperature = str(market_ctx.get("market_temperature", "warm") or "warm")
+        style_regime = str(market_ctx.get("style_regime", "balanced") or "balanced")
+        sector_map = {
+            self._normalize_theme_match_key(k): str(v or "rotation")
+            for k, v in dict(sector_tier_map or {}).items()
+            if self._normalize_theme_match_key(k)
+        }
         outlook_map = {
             self._normalize_theme_match_key(k): dict(v or {})
             for k, v in outlook_map_raw.items()
@@ -3641,8 +4172,12 @@ class LonghubangEngine:
             trend_stage = str(trend.get("trend_stage", "") or "")
             p1_score = round(float(p1.get("score", 0.0) or 0.0), 3)
             limit_quality_score = round(float(p1.get("limit_quality_score", 0.0) or 0.0), 3)
+            limit_up_status = str(p1.get("today_limit_up_status", "") or "").strip()
+            limit_up_streak = int(self._parse_streak(limit_up_status) or 0)
             theme_tokens = (clue_map.get(code, []) or [])[:6]
             concept_bias_meta = _calc_concept_bias(theme_tokens)
+            cyq_detail = dict(cyq_map.get(code, {}) or {})
+            cyq_adjust = self._calc_cyq_adjust(cyq_detail)
             quality = self._calc_candidate_data_quality(
                 net_inflow=float(net_inflow or 0.0),
                 pct_chg=pct,
@@ -3652,6 +4187,13 @@ class LonghubangEngine:
                 kline_trend_stage=trend_stage,
                 source_completeness=source_ready,
             )
+            lhb_sector_tier = self._resolve_sector_tier(theme_tokens, sector_map)
+            lhb_position_tag = self._derive_stock_position_tag(trend=trend, limit_up_streak=limit_up_streak)
+            lhb_capital_behavior_tag = self._derive_capital_behavior_tag(
+                p1=p1,
+                net_inflow=float(net_inflow or 0.0),
+                limit_quality_score=float(limit_quality_score),
+            )
             return {
                 "code": code,
                 "name": name,
@@ -3659,10 +4201,21 @@ class LonghubangEngine:
                 "pct_chg": None if pct is None else round(float(pct), 2),
                 "is_today_limit_up": bool(is_limit_up),
                 "is_limit_like_for_quota": bool(is_limit_like),
+                "limit_up_status": limit_up_status,
+                "limit_up_streak": int(limit_up_streak),
                 "limit_quality_score": limit_quality_score,
                 "p1_score": p1_score,
                 "theme_tokens": "、".join(theme_tokens),
+                "lhb_market_temperature": market_temperature,
+                "lhb_style_regime": style_regime,
+                "lhb_sector_tier": lhb_sector_tier,
+                "lhb_position_tag": lhb_position_tag,
+                "lhb_capital_behavior_tag": lhb_capital_behavior_tag,
                 "concept_user_bias": float(concept_bias_meta.get("bias", 0.0) or 0.0),
+                "cyq_winner_rate": round(float(cyq_detail.get("winner_rate", 0.0) or 0.0), 4),
+                "cyq_cost_50pct": round(float(cyq_detail.get("cost_50pct", 0.0) or 0.0), 3),
+                "cyq_weight_avg": round(float(cyq_detail.get("weight_avg", 0.0) or 0.0), 3),
+                "cyq_adjust": round(float(cyq_adjust), 3),
                 "concept_outlook_tag": str(concept_bias_meta.get("tag", "neutral") or "neutral"),
                 "concept_outlook_hits": [
                     {"theme": h[0], "outlook": h[1], "score": round(float(h[2] or 0.0), 3)}
@@ -3717,6 +4270,7 @@ class LonghubangEngine:
             out.sort(
                 key=lambda x: (
                     float(x.get("concept_user_bias", 0.0) or 0.0),
+                    float(x.get("cyq_adjust", 0.0) or 0.0),
                     float(x.get("p1_score", 0.0) or 0.0),
                     float(x.get("limit_quality_score", 0.0) or 0.0),
                     float(x.get("net_inflow", 0.0) or 0.0),
@@ -3958,6 +4512,10 @@ class LonghubangEngine:
                 item["target_price"] = row.get("target_price", item.get("target_price", "待定"))
             if not self._is_placeholder_text(row.get("hold_period", "")):
                 item["hold_period"] = row.get("hold_period", item.get("hold_period", "短线"))
+            if not self._is_placeholder_text(row.get("stop_loss", "")):
+                item["stop_loss"] = row.get("stop_loss", item.get("stop_loss", "趋势破位则减仓"))
+            if not self._is_placeholder_text(row.get("invalidation", "")):
+                item["lhb_trade_invalidation"] = row.get("invalidation", item.get("lhb_trade_invalidation", "核心逻辑失效则退出"))
         return recommended_stocks
     
     def _extract_recommended_stocks(
@@ -4045,8 +4603,12 @@ class LonghubangEngine:
                     'confidence': '',
                     'buy_price': '',
                     'target_price': '',
-                    'stop_loss': '待定',
+                    'stop_loss': '趋势破位则减仓',
                     'hold_period': '',
+                    'lhb_trade_trigger': '',
+                    'lhb_trade_stop_loss': '趋势破位则减仓',
+                    'lhb_trade_invalidation': '核心逻辑失效则退出',
+                    'lhb_holding_observation': '',
                     'is_today_limit_up': bool(is_limit_up_real),
                     'is_limit_like_for_quota': bool(is_limit_like_for_quota),
                     'latest_pct_chg': None if pct_chg is None else round(float(pct_chg), 2),
@@ -4071,9 +4633,13 @@ class LonghubangEngine:
                         )
                 recommended[-1]["reason"] = reason
                 recommended[-1]["confidence"] = str(chief_row.get("confidence", "") or "中")
-                recommended[-1]["buy_price"] = str(chief_row.get("buy_timing", "") or "待定")
-                recommended[-1]["target_price"] = str(chief_row.get("trigger_condition", "") or "待定")
+                recommended[-1]["buy_price"] = str(chief_row.get("buy_timing", "") or "分歧回踩确认")
+                recommended[-1]["target_price"] = str(chief_row.get("trigger_condition", "") or "放量承接延续")
                 recommended[-1]["hold_period"] = str(chief_row.get("hold_period", "") or "短线")
+                recommended[-1]["lhb_trade_trigger"] = recommended[-1]["target_price"]
+                recommended[-1]["lhb_trade_stop_loss"] = recommended[-1].get("stop_loss", "趋势破位则减仓")
+                recommended[-1]["lhb_trade_invalidation"] = "主线与资金共振消失则退出"
+                recommended[-1]["lhb_holding_observation"] = "关注量能、承接与板块强度"
         if not bool(enable_quota):
             selected = recommended[:rec_count]
             for idx, item in enumerate(selected, 1):

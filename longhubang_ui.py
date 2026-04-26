@@ -267,7 +267,8 @@ def display_analysis_tab():
             column_config={
                 "rank": st.column_config.NumberColumn("排序", format="%d", width="small", disabled=True),
                 "concept": st.column_config.TextColumn("题材", width="medium", disabled=True),
-                "strength_100": st.column_config.NumberColumn("强度分", format="%.2f", disabled=True),
+                "strength_score": st.column_config.NumberColumn("强度分", format="%.2f", disabled=True),
+                "strength_100": st.column_config.NumberColumn("强度100", format="%.2f", disabled=True),
                 "count": st.column_config.NumberColumn("出现次数", format="%d", disabled=True),
                 "pct_chg": st.column_config.NumberColumn("涨跌幅", format="%.2f", disabled=True),
                 "source": st.column_config.TextColumn("来源", width="small", disabled=True),
