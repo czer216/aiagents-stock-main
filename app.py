@@ -340,14 +340,21 @@ def _auth_set_user(user: dict):
 
 def _restore_auth_from_cookie_token() -> bool:
     if _auth_logged_in():
+        st.session_state.pop("auth_cookie_restore_retry", None)
         return True
 
     cookies = _cookies_ready_or_none(max_wait_sec=2.0)
     if cookies is None:
-        st.info("正在恢复登录会话，请稍候...")
-        time.sleep(0.2)
-        st.rerun()
+        retried = bool(st.session_state.get("auth_cookie_restore_retry", False))
+        if not retried:
+            st.session_state["auth_cookie_restore_retry"] = True
+            st.info("正在恢复登录会话，请稍候...")
+            time.sleep(0.2)
+            st.rerun()
+        st.session_state.pop("auth_cookie_restore_retry", None)
+        return False
 
+    st.session_state.pop("auth_cookie_restore_retry", None)
     token = str(cookies.get("session_token", "") or "")
     if not token:
         return False
