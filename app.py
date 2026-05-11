@@ -25,6 +25,7 @@ from smart_monitor_ui import smart_monitor_ui
 from news_flow_ui import display_news_flow_monitor
 from theme_peer_ui import display_theme_peer_selector
 from theme_peer_selector import ThemePeerSelector
+from auth_db import auth_db
 
 # 页面配置
 st.set_page_config(
@@ -270,7 +271,105 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+def _auth_logged_in() -> bool:
+    return bool(st.session_state.get("auth_logged_in", False))
+
+
+def _auth_role() -> str:
+    return str(st.session_state.get("auth_role", "") or "")
+
+
+def _require_admin() -> bool:
+    return _auth_role() == "admin"
+
+
+def _auth_logout():
+    for key in ["auth_logged_in", "auth_user_id", "auth_username", "auth_role", "auth_login_at"]:
+        if key in st.session_state:
+            del st.session_state[key]
+    st.rerun()
+
+
+def _auth_set_user(user: dict):
+    st.session_state["auth_logged_in"] = True
+    st.session_state["auth_user_id"] = int(user.get("id") or 0)
+    st.session_state["auth_username"] = str(user.get("username") or "")
+    st.session_state["auth_role"] = str(user.get("role") or "user")
+    st.session_state["auth_login_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _display_bootstrap_admin_page():
+    st.markdown("""
+    <div class="top-nav">
+        <h1 class="nav-title">🔐 初始化管理员</h1>
+        <p class="nav-subtitle">首次启动请先创建管理员账号</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with st.form("bootstrap_admin_form"):
+        username = st.text_input("管理员用户名", key="bootstrap_admin_username")
+        password = st.text_input("管理员密码", type="password", key="bootstrap_admin_password")
+        confirm = st.text_input("确认密码", type="password", key="bootstrap_admin_confirm")
+        submitted = st.form_submit_button("创建管理员", type="primary")
+
+    if not submitted:
+        return
+
+    if not username.strip():
+        st.error("请输入管理员用户名")
+        return
+    if len(password) < 6:
+        st.error("密码至少6位")
+        return
+    if password != confirm:
+        st.error("两次密码不一致")
+        return
+
+    try:
+        auth_db.create_user(username=username.strip(), password=password, role="admin")
+        st.success("✅ 管理员创建成功，请登录")
+        time.sleep(0.8)
+        st.rerun()
+    except Exception as e:
+        st.error(f"创建管理员失败: {str(e)}")
+
+
+def _display_login_page():
+    st.markdown("""
+    <div class="top-nav">
+        <h1 class="nav-title">🔐 用户登录</h1>
+        <p class="nav-subtitle">登录后使用系统功能</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    with st.form("login_form"):
+        username = st.text_input("用户名", key="login_username")
+        password = st.text_input("密码", type="password", key="login_password")
+        submitted = st.form_submit_button("登录", type="primary")
+
+    if not submitted:
+        return
+
+    user = auth_db.authenticate_user(username=username.strip(), password=password)
+    if not user:
+        st.error("用户名或密码错误")
+        return
+
+    _auth_set_user(user)
+    st.success(f"登录成功，欢迎 {user.get('username', '')}")
+    time.sleep(0.6)
+    st.rerun()
+
+
 def main():
+    if not auth_db.has_any_admin():
+        _display_bootstrap_admin_page()
+        return
+
+    if not _auth_logged_in():
+        _display_login_page()
+        return
+
     # 顶部标题栏
     st.markdown("""
     <div class="top-nav">
@@ -435,11 +534,28 @@ def main():
         if st.button("⚙️ 环境配置", width='stretch', key="nav_config", help="系统设置与API配置"):
             st.session_state.show_config = True
             for key in ['show_history', 'show_monitor', 'show_main_force', 'show_sector_strategy',
-                       'show_longhubang', 'show_portfolio', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_theme_peer']:
+                       'show_longhubang', 'show_portfolio', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_theme_peer', 'show_user_admin']:
+                if key in st.session_state:
+                    del st.session_state[key]
+
+        # 👥 用户管理
+        if st.button("👥 用户管理", width='stretch', key="nav_user_admin", help="管理员创建和查看用户"):
+            st.session_state.show_user_admin = True
+            for key in ['show_history', 'show_monitor', 'show_main_force', 'show_sector_strategy',
+                       'show_longhubang', 'show_portfolio', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_theme_peer', 'show_config']:
                 if key in st.session_state:
                     del st.session_state[key]
 
         st.markdown("---")
+
+        # 登录态
+        st.markdown("---")
+        username = str(st.session_state.get("auth_username", "") or "")
+        role = _auth_role() or "user"
+        role_text = "管理员" if role == "admin" else "普通用户"
+        st.caption(f"当前用户: {username} ({role_text})")
+        if st.button("🚪 退出登录", width='stretch', key="logout_btn"):
+            _auth_logout()
 
         # 系统配置
         st.markdown("### ⚙️ 系统配置")
@@ -619,6 +735,11 @@ def main():
     # 检查是否显示环境配置
     if 'show_config' in st.session_state and st.session_state.show_config:
         display_config_manager()
+        return
+
+    # 检查是否显示用户管理
+    if 'show_user_admin' in st.session_state and st.session_state.show_user_admin:
+        display_user_admin_page()
         return
 
     # 主界面
@@ -2625,6 +2746,10 @@ def display_config_manager():
     """显示环境配置管理界面"""
     st.subheader("⚙️ 环境配置管理")
 
+    is_admin = _require_admin()
+    if not is_admin:
+        st.warning("当前为普通用户，只能查看配置，不能保存或重置。")
+
     st.markdown("""
     <div class="agent-card">
         <p>在这里可以配置系统的环境变量，包括API密钥、数据源配置、量化交易配置等。</p>
@@ -3049,15 +3174,15 @@ def display_config_manager():
             else:
                 st.caption("💡 飞书机器人配置：\n1. 进入飞书群 → 设置 → 群机器人\n2. 添加机器人 → 自定义机器人\n3. 复制Webhook地址")
 
-        st.markdown("---")
-        st.info("💡 **使用说明**：\n- 可以同时启用邮件和Webhook通知\n- 实时监测和智策定时分析都会使用配置的通知方式\n- 配置后建议使用各功能中的测试按钮验证通知是否正常")
-
     # 操作按钮
     st.markdown("---")
     col1, col2, col3, col4 = st.columns([1, 1, 1, 2])
 
     with col1:
-        if st.button("💾 保存配置", type="primary", width='stretch'):
+        if st.button("💾 保存配置", type="primary", width='stretch', disabled=not is_admin):
+            if not is_admin:
+                st.error("权限不足：仅管理员可保存配置")
+                return
             # 验证配置
             is_valid, message = config_manager.validate_config(st.session_state.temp_config)
 
@@ -3082,7 +3207,10 @@ def display_config_manager():
                 st.error(f"❌ 配置验证失败: {message}")
 
     with col2:
-        if st.button("🔄 重置", width='stretch'):
+        if st.button("🔄 重置", width='stretch', disabled=not is_admin):
+            if not is_admin:
+                st.error("权限不足：仅管理员可重置配置")
+                return
             # 重置为当前文件中的值
             st.session_state.temp_config = {key: info["value"] for key, info in config_info.items()}
             st.success("✅ 已重置为当前配置")
@@ -3098,9 +3226,8 @@ def display_config_manager():
 
     # 显示当前.env文件内容
     st.markdown("---")
-    with st.expander("📄 查看当前 .env 文件内容"):
+    with st.expander("📄 查看���前 .env 文件内容"):
         current_config = config_manager.read_env()
-
         st.code(f"""# AI股票分析系统环境配置
 # 由系统自动生成和管理
 
@@ -3135,6 +3262,63 @@ WEBHOOK_TYPE="{current_config.get('WEBHOOK_TYPE', 'dingtalk')}"
 WEBHOOK_URL="{current_config.get('WEBHOOK_URL', '')}"
 WEBHOOK_KEYWORD="{current_config.get('WEBHOOK_KEYWORD', 'aiagents通知')}"
 """, language="bash")
+
+def display_user_admin_page():
+    st.subheader("👥 用户管理")
+
+    if not _require_admin():
+        st.error("权限不足：仅管理员可访问用户管理")
+        return
+
+    with st.form("create_user_form"):
+        new_username = st.text_input("新用户名", key="create_user_name")
+        new_password = st.text_input("新用户密码", type="password", key="create_user_password")
+        new_password_confirm = st.text_input("确认密码", type="password", key="create_user_password_confirm")
+        new_role = st.selectbox("角色", options=["user", "admin"], format_func=lambda x: "普通用户" if x == "user" else "管理员", key="create_user_role")
+        create_submit = st.form_submit_button("➕ 创建用户", type="primary")
+
+    if create_submit:
+        uname = str(new_username or "").strip()
+        if not uname:
+            st.error("请输入用户名")
+        elif len(new_password) < 6:
+            st.error("密码至少6位")
+        elif new_password != new_password_confirm:
+            st.error("两次密码不一致")
+        elif auth_db.get_user_by_username(uname):
+            st.error("用户名已存在")
+        else:
+            try:
+                auth_db.create_user(username=uname, password=new_password, role=new_role)
+                st.success(f"✅ 用户创建成功: {uname} ({'管理员' if new_role == 'admin' else '普通用户'})")
+            except Exception as e:
+                st.error(f"创建用户失败: {str(e)}")
+
+    users = auth_db.list_users()
+    if users:
+        users_table = pd.DataFrame(users)
+        users_table = users_table.rename(columns={
+            "id": "ID",
+            "username": "用户名",
+            "role": "角色",
+            "is_active": "状态",
+            "created_at": "创建时间",
+            "updated_at": "更新时间",
+            "last_login_at": "最近登录",
+        })
+        if "角色" in users_table.columns:
+            users_table["角色"] = users_table["角色"].apply(lambda x: "管理员" if str(x) == "admin" else "普通用户")
+        if "状态" in users_table.columns:
+            users_table["状态"] = users_table["状态"].apply(lambda x: "启用" if int(x or 0) == 1 else "禁用")
+        st.dataframe(users_table, use_container_width=True, height=320)
+
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        if st.button("⬅️ 返回", width='stretch', key="user_admin_back"):
+            if 'show_user_admin' in st.session_state:
+                del st.session_state.show_user_admin
+            st.rerun()
+
 
 def display_batch_analysis_results(results, period):
     """显示批量分析结果（对比视图）"""
