@@ -530,21 +530,22 @@ def main():
                 if key in st.session_state:
                     del st.session_state[key]
 
-        # ⚙️ 环境配置
-        if st.button("⚙️ 环境配置", width='stretch', key="nav_config", help="系统设置与API配置"):
-            st.session_state.show_config = True
-            for key in ['show_history', 'show_monitor', 'show_main_force', 'show_sector_strategy',
-                       'show_longhubang', 'show_portfolio', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_theme_peer', 'show_user_admin']:
-                if key in st.session_state:
-                    del st.session_state[key]
+        if _require_admin():
+            # ⚙️ 环境配置
+            if st.button("⚙️ 环境配置", width='stretch', key="nav_config", help="系统设置与API配置"):
+                st.session_state.show_config = True
+                for key in ['show_history', 'show_monitor', 'show_main_force', 'show_sector_strategy',
+                           'show_longhubang', 'show_portfolio', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_theme_peer', 'show_user_admin']:
+                    if key in st.session_state:
+                        del st.session_state[key]
 
-        # 👥 用户管理
-        if st.button("👥 用户管理", width='stretch', key="nav_user_admin", help="管理员创建和查看用户"):
-            st.session_state.show_user_admin = True
-            for key in ['show_history', 'show_monitor', 'show_main_force', 'show_sector_strategy',
-                       'show_longhubang', 'show_portfolio', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_theme_peer', 'show_config']:
-                if key in st.session_state:
-                    del st.session_state[key]
+            # 👥 用户管理
+            if st.button("👥 用户管理", width='stretch', key="nav_user_admin", help="管理员创建和查看用户"):
+                st.session_state.show_user_admin = True
+                for key in ['show_history', 'show_monitor', 'show_main_force', 'show_sector_strategy',
+                           'show_longhubang', 'show_portfolio', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_theme_peer', 'show_config']:
+                    if key in st.session_state:
+                        del st.session_state[key]
 
         st.markdown("---")
 
@@ -734,11 +735,19 @@ def main():
     
     # 检查是否显示环境配置
     if 'show_config' in st.session_state and st.session_state.show_config:
+        if not _require_admin():
+            del st.session_state['show_config']
+            st.warning("当前账号无权限访问环境配置")
+            return
         display_config_manager()
         return
 
     # 检查是否显示用户管理
     if 'show_user_admin' in st.session_state and st.session_state.show_user_admin:
+        if not _require_admin():
+            del st.session_state['show_user_admin']
+            st.warning("当前账号无权限访问用户管理")
+            return
         display_user_admin_page()
         return
 
