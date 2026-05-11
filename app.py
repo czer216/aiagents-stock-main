@@ -324,7 +324,7 @@ def _auth_logout():
         except Exception:
             pass
 
-    for key in ["auth_logged_in", "auth_user_id", "auth_username", "auth_role", "auth_login_at", "auth_session_token"]:
+    for key in ["auth_logged_in", "auth_user_id", "auth_username", "auth_role", "auth_login_at", "auth_session_token", "auth_cookie_needs_sync", "auth_cookie_restore_retry"]:
         if key in st.session_state:
             del st.session_state[key]
     st.rerun()
@@ -336,6 +336,27 @@ def _auth_set_user(user: dict):
     st.session_state["auth_username"] = str(user.get("username") or "")
     st.session_state["auth_role"] = str(user.get("role") or "user")
     st.session_state["auth_login_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _ensure_cookie_session_persisted() -> None:
+    token = str(st.session_state.get("auth_session_token", "") or "").strip()
+    if not token:
+        return
+    if not bool(st.session_state.get("auth_cookie_needs_sync", False)):
+        return
+
+    cookies = _cookies_ready_or_none(max_wait_sec=2.0)
+    if cookies is None:
+        return
+
+    try:
+        current = str(cookies.get("session_token", "") or "").strip()
+        if current != token:
+            cookies["session_token"] = token
+            cookies.save()
+        st.session_state["auth_cookie_needs_sync"] = False
+    except Exception:
+        pass
 
 
 def _restore_auth_from_cookie_token() -> bool:
@@ -434,10 +455,12 @@ def _display_login_page():
     try:
         token = auth_db.create_session(int(user.get("id") or 0), days=7)
         st.session_state["auth_session_token"] = token
+        st.session_state["auth_cookie_needs_sync"] = True
         cookies = _cookies_ready_or_none()
         if cookies is not None:
             cookies["session_token"] = token
             cookies.save()
+            st.session_state["auth_cookie_needs_sync"] = False
     except Exception:
         pass
     st.success(f"登录成功，欢迎 {user.get('username', '')}")
@@ -451,6 +474,7 @@ def main():
         return
 
     _restore_auth_from_cookie_token()
+    _ensure_cookie_session_persisted()
     if not _auth_logged_in():
         _display_login_page()
         return
