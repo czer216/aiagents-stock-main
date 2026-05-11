@@ -21,6 +21,8 @@ import pandas as pd
 from data_source_manager import data_source_manager
 from tushare_proxy_rate_limit import call_tushare_with_timeout
 from longhubang_kline_signals import SevenDayKlineTrendFetcher
+from longhubang_hot_signals import KPLListHeatFetcher
+from longhubang_history import LonghubangHistoryService
 
 
 @dataclass
@@ -68,6 +70,7 @@ class ThemePeerSelector:
         self._stock_basic_cache: Optional[pd.DataFrame] = None
         self._ai_client = None
         self._trend_fetcher = SevenDayKlineTrendFetcher()
+        self.history_service = LonghubangHistoryService()
         self._last_cache_error = ""
         self.kline_db_path = self._resolve_kline_db_path()
         self._ensure_kline_cache_table()
@@ -175,10 +178,12 @@ class ThemePeerSelector:
             "target_name": "",
             "start_date": "",
             "end_date": "",
+            "latest_trade_date": "",
             "feature_method": "vec(0.5)+path(0.5)",
             "candidate_universe": 0,
             "scanned": 0,
             "valid": 0,
+            "excluded_not_latest_count": 0,
             "candidates": [],
             "error": "",
         }
@@ -253,9 +258,11 @@ class ThemePeerSelector:
 
         out["target_feature"] = target_detail
         out["compare_mode"] = "target_range_vs_candidate_latest_window"
+        out["price_adjustment_mode"] = "qfq_window_normalized"
 
         target_bars = int(len(target_df.index)) if hasattr(target_df, "index") else 0
         latest_trade_date = self._get_cache_latest_trade_date()
+        out["latest_trade_date"] = latest_trade_date
 
         universe = self._build_mainboard_universe(limit=max_candidates)
         if symbol in universe:
@@ -278,6 +285,20 @@ class ThemePeerSelector:
                 cand_df = self._load_latest_window_from_cache(symbol=cand_symbol, bars=target_bars)
             if cand_df is None or cand_df.empty:
                 continue
+
+            candidate_window_end = ""
+            if "日期" in cand_df.columns and not cand_df["日期"].dropna().empty:
+                try:
+                    candidate_window_end = pd.to_datetime(cand_df["日期"].dropna().iloc[-1], errors="coerce").strftime("%Y%m%d")
+                except Exception:
+                    candidate_window_end = ""
+            elif latest_trade_date:
+                candidate_window_end = latest_trade_date
+
+            if latest_trade_date and candidate_window_end != latest_trade_date:
+                out["excluded_not_latest_count"] += 1
+                continue
+
             cand_vector, cand_detail = self._extract_feature_from_kline(cand_df)
             if not cand_vector:
                 continue
@@ -300,7 +321,7 @@ class ThemePeerSelector:
                     "latest_change_pct": round(float(cand_detail.get("latest_change_pct", 0.0) or 0.0), 2),
                     "vol_ratio": round(float(cand_detail.get("vol_ratio", 0.0) or 0.0), 2),
                     "feature": cand_detail,
-                    "candidate_window_end": cand_detail.get("latest_trade_date", ""),
+                    "candidate_window_end": candidate_window_end or cand_detail.get("latest_trade_date", ""),
                     "candidate_window_bars": int(len(cand_df.index)) if hasattr(cand_df, "index") else 0,
                 }
             )
@@ -361,6 +382,7 @@ class ThemePeerSelector:
                     vol REAL,
                     amount REAL,
                     pct_chg REAL,
+                    adj_factor REAL,
                     source TEXT,
                     updated_at TEXT,
                     PRIMARY KEY (symbol, trade_date)
@@ -378,6 +400,10 @@ class ThemePeerSelector:
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_kline_daily_date ON kline_daily(trade_date)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_kline_daily_symbol ON kline_daily(symbol)")
+            try:
+                conn.execute("ALTER TABLE kline_daily ADD COLUMN adj_factor REAL")
+            except Exception:
+                pass
             conn.commit()
 
     def _get_sync_meta(self, key: str) -> str:
@@ -509,6 +535,52 @@ class ThemePeerSelector:
         count = int(row[0]) if row and row[0] is not None else 0
         return count >= max(1, int(min_rows or 1))
 
+    def _trade_date_missing_adj_factor(self, trade_date: str, min_missing_rows: int = 20) -> bool:
+        text = str(trade_date or "").strip().replace("-", "")
+        if not re.fullmatch(r"\d{8}", text):
+            return False
+        try:
+            with sqlite3.connect(self.kline_db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM kline_daily
+                    WHERE trade_date = ? AND (adj_factor IS NULL OR adj_factor <= 0)
+                    """,
+                    (text,),
+                ).fetchone()
+            missing = int(row[0]) if row and row[0] is not None else 0
+            return missing >= max(1, int(min_missing_rows or 1))
+        except Exception:
+            return False
+
+    def _has_any_missing_adj_factor(self, start_trade_date: str, end_trade_date: str, min_missing_rows: int = 20) -> bool:
+        start8 = str(start_trade_date or "").strip().replace("-", "")
+        end8 = str(end_trade_date or "").strip().replace("-", "")
+        if not re.fullmatch(r"\d{8}", start8) or not re.fullmatch(r"\d{8}", end8):
+            return False
+        if start8 > end8:
+            start8, end8 = end8, start8
+        try:
+            with sqlite3.connect(self.kline_db_path) as conn:
+                row = conn.execute(
+                    """
+                    SELECT 1
+                    FROM (
+                        SELECT trade_date,
+                               SUM(CASE WHEN adj_factor IS NULL OR adj_factor <= 0 THEN 1 ELSE 0 END) AS missing_rows
+                        FROM kline_daily
+                        WHERE trade_date >= ? AND trade_date <= ?
+                        GROUP BY trade_date
+                    ) t
+                    WHERE t.missing_rows >= ?
+                    LIMIT 1
+                    """,
+                    (start8, end8, max(1, int(min_missing_rows or 1))),
+                ).fetchone()
+            return row is not None
+        except Exception:
+            return False
+
     def _fetch_tushare_daily_snapshot(self, trade_date: str) -> pd.DataFrame:
         if not self.pro or not hasattr(self.pro, "daily"):
             return pd.DataFrame()
@@ -524,7 +596,43 @@ class ThemePeerSelector:
             return pd.DataFrame()
         return df
 
-    def _upsert_daily_snapshot_rows(self, trade_date: str, df: pd.DataFrame, symbol_set: Optional[set] = None) -> int:
+    def _fetch_adj_factor_map(self, trade_date: str) -> Dict[str, float]:
+        if not self.pro or not hasattr(self.pro, "adj_factor"):
+            return {}
+        try:
+            df = call_tushare_with_timeout(
+                api_callable=lambda: self.pro.adj_factor(trade_date=trade_date),
+                timeout_sec=45,
+                api_name="adj_factor",
+            )
+        except Exception:
+            return {}
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {}
+
+        code_col = self._find_col(df, ["ts_code", "code", "symbol", "con_code"])
+        factor_col = self._find_col(df, ["adj_factor"])
+        if not code_col or not factor_col:
+            return {}
+
+        out: Dict[str, float] = {}
+        for _, row in df.iterrows():
+            symbol = self._normalize_symbol(row.get(code_col))
+            if not symbol:
+                continue
+            val = self._to_float(row.get(factor_col))
+            if val is None or val <= 0:
+                continue
+            out[symbol] = float(val)
+        return out
+
+    def _upsert_daily_snapshot_rows(
+        self,
+        trade_date: str,
+        df: pd.DataFrame,
+        symbol_set: Optional[set] = None,
+        adj_factor_map: Optional[Dict[str, float]] = None,
+    ) -> int:
         if df is None or df.empty:
             return 0
 
@@ -554,6 +662,12 @@ class ThemePeerSelector:
             close_v = _num(row.get("close"))
             if close_v <= 0:
                 continue
+            adj_factor = None
+            if adj_factor_map:
+                try:
+                    adj_factor = float(adj_factor_map.get(symbol)) if adj_factor_map.get(symbol) is not None else None
+                except Exception:
+                    adj_factor = None
             rows.append(
                 (
                     symbol,
@@ -565,6 +679,7 @@ class ThemePeerSelector:
                     _num(row.get("vol")),
                     _num(row.get("amount")),
                     _num(row.get("pct_chg")),
+                    adj_factor,
                     "tushare.daily_snapshot",
                     now_text,
                 )
@@ -577,8 +692,8 @@ class ThemePeerSelector:
             conn.executemany(
                 """
                 INSERT INTO kline_daily(
-                    symbol, trade_date, open, high, low, close, vol, amount, pct_chg, source, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    symbol, trade_date, open, high, low, close, vol, amount, pct_chg, adj_factor, source, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol, trade_date) DO UPDATE SET
                     open=excluded.open,
                     high=excluded.high,
@@ -587,6 +702,7 @@ class ThemePeerSelector:
                     vol=excluded.vol,
                     amount=excluded.amount,
                     pct_chg=excluded.pct_chg,
+                    adj_factor=COALESCE(excluded.adj_factor, kline_daily.adj_factor),
                     source=excluded.source,
                     updated_at=excluded.updated_at
                 """,
@@ -638,6 +754,7 @@ class ThemePeerSelector:
             "error_symbols": 0,
             "requested_trade_dates": 0,
             "skipped_trade_dates": 0,
+            "refill_adj_factor_dates": 0,
         }
         if symbol_set is None:
             meta["symbols"] = -1
@@ -647,7 +764,8 @@ class ThemePeerSelector:
 
         if not full_refresh:
             last_sync = self._get_sync_meta("mainboard_last_sync_date")
-            if last_sync and re.fullmatch(r"\d{8}", last_sync):
+            has_missing_adj = self._has_any_missing_adj_factor(start8, end8)
+            if (not has_missing_adj) and last_sync and re.fullmatch(r"\d{8}", last_sync):
                 try:
                     next_dt = datetime.strptime(last_sync, "%Y%m%d") + timedelta(days=1)
                     start8 = max(start8, next_dt.strftime("%Y%m%d"))
@@ -676,17 +794,21 @@ class ThemePeerSelector:
         synced_symbols: set = set()
         for trade_date in trade_dates:
             already = self._is_trade_date_cached(trade_date, min_rows=max(50, len(symbol_set) // 4))
-            if already and not full_refresh:
+            need_refill_adj = self._trade_date_missing_adj_factor(trade_date, min_missing_rows=max(20, len(symbol_set) // 10))
+            if already and not full_refresh and not need_refill_adj:
                 meta["skipped_trade_dates"] += 1
                 continue
+            if need_refill_adj:
+                meta["refill_adj_factor_dates"] += 1
 
             meta["requested_trade_dates"] += 1
             day_df = self._fetch_tushare_daily_snapshot(trade_date)
+            adj_factor_map = self._fetch_adj_factor_map(trade_date)
             if day_df is None or day_df.empty:
                 meta["error_symbols"] += 1
                 continue
             try:
-                written = self._upsert_daily_snapshot_rows(trade_date, day_df, symbol_set)
+                written = self._upsert_daily_snapshot_rows(trade_date, day_df, symbol_set, adj_factor_map=adj_factor_map)
                 meta["written_rows"] += int(written)
                 if written > 0:
                     code_col = self._find_col(day_df, ["ts_code", "code", "symbol", "con_code"])
@@ -737,7 +859,7 @@ class ThemePeerSelector:
                 conn.execute("PRAGMA query_only=ON")
                 if end8:
                     query = """
-                    SELECT trade_date, open, high, low, close, vol
+                    SELECT trade_date, open, high, low, close, vol, adj_factor
                     FROM kline_daily
                     WHERE symbol = ? AND trade_date <= ?
                     ORDER BY trade_date DESC
@@ -746,7 +868,7 @@ class ThemePeerSelector:
                     df = pd.read_sql_query(query, conn, params=(symbol, end8, bars_n))
                 else:
                     query = """
-                    SELECT trade_date, open, high, low, close, vol
+                    SELECT trade_date, open, high, low, close, vol, adj_factor
                     FROM kline_daily
                     WHERE symbol = ?
                     ORDER BY trade_date DESC
@@ -761,18 +883,46 @@ class ThemePeerSelector:
             return pd.DataFrame()
 
         df = df.sort_values("trade_date").reset_index(drop=True)
+        adjusted_df, used_adjustment = self._build_adjusted_ohlc(df)
         out = pd.DataFrame(
             {
                 "日期": pd.to_datetime(df["trade_date"], format="%Y%m%d", errors="coerce"),
-                "开盘": pd.to_numeric(df["open"], errors="coerce"),
-                "最高": pd.to_numeric(df["high"], errors="coerce"),
-                "最低": pd.to_numeric(df["low"], errors="coerce"),
-                "收盘": pd.to_numeric(df["close"], errors="coerce"),
+                "开盘": pd.to_numeric(adjusted_df["open"] if used_adjustment else df["open"], errors="coerce"),
+                "最高": pd.to_numeric(adjusted_df["high"] if used_adjustment else df["high"], errors="coerce"),
+                "最低": pd.to_numeric(adjusted_df["low"] if used_adjustment else df["low"], errors="coerce"),
+                "收盘": pd.to_numeric(adjusted_df["close"] if used_adjustment else df["close"], errors="coerce"),
                 "成交量": pd.to_numeric(df["vol"], errors="coerce"),
             }
         )
         out = out.dropna(subset=["日期", "收盘"]).reset_index(drop=True)
         return out
+
+    def _build_adjusted_ohlc(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, bool]:
+        cols = ["open", "high", "low", "close"]
+        out = df.copy()
+        for c in cols:
+            out[c] = pd.to_numeric(out.get(c), errors="coerce")
+        adj = pd.to_numeric(out.get("adj_factor"), errors="coerce")
+        if adj is None or adj.empty:
+            return out, False
+
+        valid = adj.notna() & (adj > 0)
+        for c in cols:
+            valid = valid & out[c].notna()
+        if not bool(valid.any()):
+            return out, False
+
+        end_factor = None
+        for i in range(len(out) - 1, -1, -1):
+            if valid.iloc[i]:
+                end_factor = float(adj.iloc[i])
+                break
+        if end_factor is None or end_factor <= 0:
+            return out, False
+
+        for c in cols:
+            out.loc[valid, c] = out.loc[valid, c] * adj.loc[valid] / end_factor
+        return out, True
 
     def _load_kline_from_cache(self, symbol: str, start_date: str, end_date: str) -> pd.DataFrame:
         symbol = self._normalize_symbol(symbol)
@@ -792,7 +942,7 @@ class ThemePeerSelector:
             with sqlite3.connect(self.kline_db_path, timeout=15) as conn:
                 conn.execute("PRAGMA query_only=ON")
                 query = """
-                SELECT trade_date, open, high, low, close, vol
+                SELECT trade_date, open, high, low, close, vol, adj_factor
                 FROM kline_daily
                 WHERE symbol = ? AND trade_date >= ? AND trade_date <= ?
                 ORDER BY trade_date ASC
@@ -805,18 +955,310 @@ class ThemePeerSelector:
         if df is None or df.empty:
             return pd.DataFrame()
 
+        adjusted_df, used_adjustment = self._build_adjusted_ohlc(df)
         out = pd.DataFrame(
             {
                 "日期": pd.to_datetime(df["trade_date"], format="%Y%m%d", errors="coerce"),
-                "开盘": pd.to_numeric(df["open"], errors="coerce"),
-                "最高": pd.to_numeric(df["high"], errors="coerce"),
-                "最低": pd.to_numeric(df["low"], errors="coerce"),
-                "收盘": pd.to_numeric(df["close"], errors="coerce"),
+                "开盘": pd.to_numeric(adjusted_df["open"] if used_adjustment else df["open"], errors="coerce"),
+                "最高": pd.to_numeric(adjusted_df["high"] if used_adjustment else df["high"], errors="coerce"),
+                "最低": pd.to_numeric(adjusted_df["low"] if used_adjustment else df["low"], errors="coerce"),
+                "收盘": pd.to_numeric(adjusted_df["close"] if used_adjustment else df["close"], errors="coerce"),
                 "成交量": pd.to_numeric(df["vol"], errors="coerce"),
             }
         )
         out = out.dropna(subset=["日期", "收盘"]).reset_index(drop=True)
         return out
+
+    def recommend_bottom_volume_arbitrage(
+        self,
+        end_date: Optional[str] = None,
+        top_n: int = 20,
+        max_candidates: Optional[int] = None,
+        breakout_min_vol_multiple: float = 1.8,
+        breakout_min_body_pct: float = 6.0,
+        pullback_max_retrace: float = 0.6,
+        pullback_max_vol_ratio: float = 0.5,
+        best_vol_ratio: float = 1.0 / 3.0,
+        hotspot_weight: float = 0.8,
+        bottom_lookback_days: int = 60,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "success": False,
+            "end_date": "",
+            "latest_trade_date": "",
+            "candidate_universe": 0,
+            "scanned": 0,
+            "valid": 0,
+            "candidates": [],
+            "error": "",
+            "price_adjustment_mode": "qfq_window_normalized",
+            "params": {
+                "breakout_min_vol_multiple": float(breakout_min_vol_multiple),
+                "breakout_min_body_pct": float(breakout_min_body_pct),
+                "pullback_max_retrace": float(pullback_max_retrace),
+                "pullback_max_vol_ratio": float(pullback_max_vol_ratio),
+                "best_vol_ratio": float(best_vol_ratio),
+                "hotspot_weight": float(hotspot_weight),
+                "bottom_lookback_days": int(bottom_lookback_days),
+            },
+        }
+
+        end_dt = self._parse_date_flexible(end_date or datetime.now().strftime("%Y-%m-%d"))
+        if end_dt is None:
+            out["error"] = "结束日期无效"
+            return out
+        out["end_date"] = end_dt.strftime("%Y-%m-%d")
+
+        end8 = end_dt.strftime("%Y%m%d")
+        last_sync = self._get_sync_meta("mainboard_last_sync_date")
+        need_sync = (not last_sync) or (last_sync < end8)
+        if need_sync:
+            sync_meta = self.sync_mainboard_kline_cache(
+                start_date="2026-01-01",
+                end_date=out["end_date"],
+                full_refresh=False,
+            )
+        else:
+            sync_meta = {
+                "success": True,
+                "mode": "skip_up_to_date",
+                "db_path": self.kline_db_path,
+                "last_sync": last_sync,
+                "requested_trade_dates": 0,
+                "skipped_trade_dates": 0,
+                "written_rows": 0,
+                "synced_symbols": 0,
+                "error_symbols": 0,
+                "symbols": 0,
+            }
+        out["kline_cache_sync"] = sync_meta
+
+        latest_trade_date = self._get_cache_latest_trade_date()
+        out["latest_trade_date"] = latest_trade_date
+        if not latest_trade_date:
+            out["error"] = "K线缓存为空，请先同步"
+            return out
+
+        stock_map = self._get_stock_name_map()
+        universe = self._build_mainboard_universe(limit=max_candidates)
+        out["candidate_universe"] = len(universe)
+        if not universe:
+            out["error"] = "主板候选池为空"
+            return out
+
+        bottom_lookback_days = max(10, min(int(bottom_lookback_days or 60), 250))
+
+        rows: List[Dict[str, Any]] = []
+        for symbol in universe:
+            out["scanned"] += 1
+            df = self._load_latest_window_from_cache(symbol=symbol, bars=20, end_trade_date=latest_trade_date)
+            if df is None or df.empty or len(df.index) < 8:
+                continue
+            signal = self._detect_bottom_volume_arbitrage(
+                df,
+                breakout_min_vol_multiple=float(breakout_min_vol_multiple),
+                breakout_min_body_pct=float(breakout_min_body_pct),
+                pullback_max_retrace=float(pullback_max_retrace),
+                pullback_max_vol_ratio=float(pullback_max_vol_ratio),
+                best_vol_ratio=float(best_vol_ratio),
+                bottom_lookback_days=int(bottom_lookback_days),
+            )
+            if not signal.get("hit"):
+                continue
+            out["valid"] += 1
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": stock_map.get(symbol, ""),
+                    "signal_score": round(float(signal.get("score", 0.0) or 0.0), 4),
+                    "breakout_date": str(signal.get("breakout_date", "") or ""),
+                    "breakout_vol_multiple": round(float(signal.get("breakout_vol_multiple", 0.0) or 0.0), 3),
+                    "breakout_body_pct": round(float(signal.get("breakout_body_pct", 0.0) or 0.0), 2),
+                    "pullback_retrace_ratio": round(float(signal.get("pullback_retrace_ratio", 0.0) or 0.0), 4),
+                    "pullback_vol_ratio": round(float(signal.get("pullback_vol_ratio", 0.0) or 0.0), 4),
+                    "best_ratio_gap": round(float(signal.get("best_ratio_gap", 0.0) or 0.0), 4),
+                    "latest_close": round(float(signal.get("latest_close", 0.0) or 0.0), 2),
+                    "reason": str(signal.get("reason", "") or ""),
+                    "hot_themes": [],
+                    "hot_theme_max_score": 0.0,
+                    "hot_theme_boost": 0.0,
+                    "final_score": round(float(signal.get("score", 0.0) or 0.0), 4),
+                }
+            )
+
+        if rows and float(hotspot_weight) > 0:
+            sample_n = max(30, min(len(rows), max(50, int(top_n or 20) * 3)))
+            symbols_for_hot = [str(r.get("symbol") or "") for r in rows[:sample_n] if str(r.get("symbol") or "")]
+            if symbols_for_hot:
+                try:
+                    heat_fetcher = KPLListHeatFetcher()
+                    heat_data = heat_fetcher.get_heat_data(
+                        days=3,
+                        end_date=end8,
+                        stock_codes=symbols_for_hot,
+                        exact_trade_date_only=False,
+                    )
+                    theme_heat_map = (heat_data or {}).get("theme_heat_map", {}) or {}
+                    stock_kpl_map = (heat_data or {}).get("stock_kpl_map", {}) or {}
+                    for r in rows:
+                        code = str(r.get("symbol") or "")
+                        if not code:
+                            continue
+                        kpl_item = stock_kpl_map.get(code) or {}
+                        themes = list(kpl_item.get("themes", []) or [])
+                        theme_scores = [float(theme_heat_map.get(t, 0.0) or 0.0) for t in themes]
+                        hot_max = max(theme_scores) if theme_scores else 0.0
+                        boost = min(max(hot_max / 4.0, 0.0), 1.0) * float(hotspot_weight)
+                        r["hot_themes"] = themes[:5]
+                        r["hot_theme_max_score"] = round(hot_max, 4)
+                        r["hot_theme_boost"] = round(boost, 4)
+                        r["final_score"] = round(float(r.get("signal_score", 0.0) or 0.0) + boost, 4)
+                except Exception:
+                    pass
+
+        if rows:
+            try:
+                history_codes = [str(r.get("symbol") or "") for r in rows if str(r.get("symbol") or "")]
+                history_meta = self.history_service.batch_query_stock_history_themes(history_codes, before_date=end8, max_themes=8)
+                history_items = (history_meta or {}).get("items", {}) or {}
+                for r in rows:
+                    code = str(r.get("symbol") or "")
+                    history_item = history_items.get(code) or {}
+                    r["history_themes"] = list(history_item.get("themes", []) or [])
+                    r["history_theme_source_date"] = str(history_item.get("theme_source_date", "") or "")
+                    if r["history_themes"]:
+                        r["history_themes_text"] = "、".join(r["history_themes"][:5])
+                    else:
+                        r["history_themes_text"] = ""
+            except Exception:
+                for r in rows:
+                    r["history_themes"] = []
+                    r["history_theme_source_date"] = ""
+                    r["history_themes_text"] = ""
+
+        rows.sort(
+            key=lambda x: (
+                float(x.get("final_score", x.get("signal_score", 0.0)) or 0.0),
+                float(x.get("signal_score", 0.0) or 0.0),
+                float(x.get("breakout_vol_multiple", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        top_rows = rows[:max(1, int(top_n or 20))]
+        for i, r in enumerate(top_rows, 1):
+            r["rank"] = i
+
+        out["success"] = True
+        out["candidates"] = top_rows
+        if not top_rows:
+            out["error"] = "未找到满足底部放量套利规则的标的"
+        return out
+
+    def _detect_bottom_volume_arbitrage(
+        self,
+        df: pd.DataFrame,
+        breakout_min_vol_multiple: float,
+        breakout_min_body_pct: float,
+        pullback_max_retrace: float,
+        pullback_max_vol_ratio: float,
+        best_vol_ratio: float,
+        bottom_lookback_days: int,
+    ) -> Dict[str, Any]:
+        if df is None or df.empty or len(df.index) < 8:
+            return {"hit": False, "reason": "bars_not_enough"}
+
+        work = df.copy().reset_index(drop=True)
+        close = pd.to_numeric(work.get("收盘"), errors="coerce")
+        open_ = pd.to_numeric(work.get("开盘"), errors="coerce")
+        low = pd.to_numeric(work.get("最低"), errors="coerce")
+        vol = pd.to_numeric(work.get("成交量"), errors="coerce")
+        dates = pd.to_datetime(work.get("日期"), errors="coerce")
+
+        n = len(work.index)
+        recent_breakout_start = max(3, n - 5)
+        breakout_idx = -1
+        breakout_vol_multiple = 0.0
+        breakout_body_pct = 0.0
+        for i in range(recent_breakout_start, n - 1):
+            o = float(open_.iloc[i]) if pd.notna(open_.iloc[i]) else 0.0
+            c = float(close.iloc[i]) if pd.notna(close.iloc[i]) else 0.0
+            v = float(vol.iloc[i]) if pd.notna(vol.iloc[i]) else 0.0
+            prev_close = float(close.iloc[i - 1]) if i > 0 and pd.notna(close.iloc[i - 1]) else 0.0
+            if o <= 0 or c <= 0 or v <= 0 or prev_close <= 0:
+                continue
+            if c <= o:
+                continue
+            real_up_pct = (c - prev_close) / prev_close * 100.0
+            prev = vol.iloc[max(0, i - 3):i]
+            prev_avg = float(pd.to_numeric(prev, errors="coerce").dropna().mean()) if len(prev) else 0.0
+            if prev_avg <= 0:
+                continue
+            vol_multiple = v / prev_avg
+            if real_up_pct < breakout_min_body_pct or vol_multiple < breakout_min_vol_multiple:
+                continue
+            low_ref = pd.to_numeric(low.iloc[max(0, i - int(bottom_lookback_days)):i + 1], errors="coerce").dropna()
+            if low_ref.empty:
+                continue
+            bottom_pos = (c - float(low_ref.min())) / max(c, 1e-9)
+            if bottom_pos > 0.18:
+                continue
+            breakout_idx = i
+            breakout_vol_multiple = vol_multiple
+            breakout_body_pct = real_up_pct
+
+        if breakout_idx < 0:
+            return {"hit": False, "reason": "no_breakout"}
+
+        b_open = float(open_.iloc[breakout_idx])
+        b_close = float(close.iloc[breakout_idx])
+        b_vol = float(vol.iloc[breakout_idx])
+        if b_open <= 0 or b_close <= 0 or b_vol <= 0 or b_close <= b_open:
+            return {"hit": False, "reason": "invalid_breakout"}
+
+        after_low = pd.to_numeric(low.iloc[breakout_idx + 1:], errors="coerce").dropna()
+        if after_low.empty:
+            return {"hit": False, "reason": "no_pullback"}
+        pullback_low = float(after_low.min())
+        retrace_denom = max(b_close - b_open, 1e-9)
+        retrace_ratio = (b_close - pullback_low) / retrace_denom
+
+        after_vol = pd.to_numeric(vol.iloc[breakout_idx + 1:], errors="coerce").dropna()
+        if after_vol.empty:
+            return {"hit": False, "reason": "no_pullback_vol"}
+        pullback_vol_ratio = float(after_vol.mean()) / b_vol
+
+        retrace_ok = retrace_ratio <= pullback_max_retrace
+        vol_ok = pullback_vol_ratio < pullback_max_vol_ratio
+        if not (retrace_ok and vol_ok):
+            return {
+                "hit": False,
+                "reason": f"rule_fail(retrace={retrace_ratio:.3f},vol={pullback_vol_ratio:.3f})",
+            }
+
+        best_gap = abs(pullback_vol_ratio - best_vol_ratio)
+        score = 1.0
+        score += min(1.5, max(0.0, breakout_vol_multiple - breakout_min_vol_multiple))
+        score += min(1.0, max(0.0, (pullback_max_retrace - retrace_ratio) * 3.0))
+        score += min(1.0, max(0.0, (pullback_max_vol_ratio - pullback_vol_ratio) * 3.0))
+        score += max(0.0, 0.8 - best_gap * 2.4)
+
+        breakout_date = ""
+        if breakout_idx < len(dates) and pd.notna(dates.iloc[breakout_idx]):
+            breakout_date = pd.to_datetime(dates.iloc[breakout_idx]).strftime("%Y-%m-%d")
+
+        latest_close = float(close.iloc[-1]) if len(close) else 0.0
+        return {
+            "hit": True,
+            "reason": f"倍量{breakout_vol_multiple:.2f}x, 回撤{retrace_ratio:.2f}, 回踩量比{pullback_vol_ratio:.2f}",
+            "score": score,
+            "breakout_date": breakout_date,
+            "breakout_vol_multiple": breakout_vol_multiple,
+            "breakout_body_pct": breakout_body_pct,
+            "pullback_retrace_ratio": retrace_ratio,
+            "pullback_vol_ratio": pullback_vol_ratio,
+            "best_ratio_gap": best_gap,
+            "latest_close": latest_close,
+        }
 
     def _candidate_to_dict(self, item: PeerCandidate) -> Dict[str, Any]:
         return {
@@ -947,8 +1389,11 @@ class ThemePeerSelector:
     def _build_mainboard_universe(self, limit: Optional[int] = None) -> List[str]:
         stock_map = self._get_stock_name_map()
         symbols = []
-        for symbol in stock_map.keys():
+        for symbol, name in stock_map.items():
             if not symbol:
+                continue
+            name_text = str(name or "").upper()
+            if "ST" in name_text:
                 continue
             if self._is_filtered_market(symbol):
                 continue
@@ -956,9 +1401,9 @@ class ThemePeerSelector:
                 continue
             symbols.append(symbol)
         symbols = sorted(set(symbols))
-        if limit is None:
+        if limit is None or int(limit or 0) <= 0:
             return symbols
-        cap = max(80, min(int(limit or 220), 1200))
+        cap = max(80, int(limit))
         return symbols[:cap]
 
     def _parse_date_flexible(self, value: Any) -> Optional[datetime]:

@@ -2427,3 +2427,102 @@ class LonghubangHistoryService:
             "target_realtime_update_time": target_realtime_update_time,
             "target_realtime_status": target_realtime_status,
         }
+
+    def batch_query_stock_history_themes(
+        self,
+        stock_codes: List[str],
+        before_date: Optional[str] = None,
+        max_themes: int = 8,
+    ) -> Dict[str, Any]:
+        codes = [self._normalize_code(x) for x in (stock_codes or [])]
+        codes = [x for x in codes if x]
+        if not codes:
+            return {"success": True, "items": {}, "before_date": ""}
+
+        before8 = self._to_date8(before_date) if before_date else datetime.now().strftime("%Y%m%d")
+        if not before8:
+            before8 = datetime.now().strftime("%Y%m%d")
+
+        conn = self._get_connection()
+        items: Dict[str, Dict[str, Any]] = {code: {"themes": [], "theme_source_date": "", "stock_name": ""} for code in codes}
+
+        try:
+            placeholders = ",".join(["?"] * len(codes))
+
+            rows = conn.execute(
+                f"""
+                WITH latest_map AS (
+                    SELECT stock_code, MAX(trade_date) AS latest_trade_date
+                    FROM longhubang_stock_theme_map_2026
+                    WHERE trade_date < ?
+                      AND stock_code IN ({placeholders})
+                    GROUP BY stock_code
+                )
+                SELECT lm.stock_code, lm.latest_trade_date, m.theme, s.stock_name
+                FROM latest_map lm
+                JOIN longhubang_stock_theme_map_2026 m
+                  ON m.stock_code = lm.stock_code AND m.trade_date = lm.latest_trade_date
+                LEFT JOIN longhubang_daily_snapshot_2026 s
+                  ON s.stock_code = lm.stock_code AND s.trade_date = lm.latest_trade_date
+                ORDER BY lm.stock_code, m.theme
+                """,
+                [before8] + codes,
+            ).fetchall()
+
+            for row in rows:
+                code = self._normalize_code(row[0])
+                theme = str(row[2] or "").strip()
+                if not code or not theme or self._is_noise_theme_label(theme):
+                    continue
+                item = items.setdefault(code, {"themes": [], "theme_source_date": "", "stock_name": ""})
+                if theme not in item["themes"]:
+                    item["themes"].append(theme)
+                item["theme_source_date"] = str(row[1] or item["theme_source_date"] or "")
+                if not item["stock_name"]:
+                    item["stock_name"] = str(row[3] or "").strip()
+
+            fallback_rows = conn.execute(
+                f"""
+                WITH latest_snap AS (
+                    SELECT stock_code, MAX(trade_date) AS latest_trade_date
+                    FROM longhubang_daily_snapshot_2026
+                    WHERE trade_date < ?
+                      AND stock_code IN ({placeholders})
+                    GROUP BY stock_code
+                )
+                SELECT ls.stock_code, ls.latest_trade_date, s.themes, s.stock_name
+                FROM latest_snap ls
+                JOIN longhubang_daily_snapshot_2026 s
+                  ON s.stock_code = ls.stock_code AND s.trade_date = ls.latest_trade_date
+                ORDER BY ls.stock_code
+                """,
+                [before8] + codes,
+            ).fetchall()
+
+            for row in fallback_rows:
+                code = self._normalize_code(row[0])
+                raw_themes = row[2]
+                if not code or raw_themes is None:
+                    continue
+                item = items.setdefault(code, {"themes": [], "theme_source_date": "", "stock_name": ""})
+                if not item["themes"]:
+                    parsed = self._json_to_list(raw_themes)
+                    for theme in parsed:
+                        if theme and not self._is_noise_theme_label(theme) and theme not in item["themes"]:
+                            item["themes"].append(theme)
+                    if not item["themes"]:
+                        for theme in self._split_theme_tokens(raw_themes):
+                            if theme and not self._is_noise_theme_label(theme) and theme not in item["themes"]:
+                                item["themes"].append(theme)
+                if not item["theme_source_date"]:
+                    item["theme_source_date"] = str(row[1] or "")
+                if not item["stock_name"]:
+                    item["stock_name"] = str(row[3] or "").strip()
+
+        finally:
+            conn.close()
+
+        for code, item in items.items():
+            item["themes"] = item["themes"][: max(1, int(max_themes or 8))]
+
+        return {"success": True, "items": items, "before_date": before8}

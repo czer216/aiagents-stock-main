@@ -364,7 +364,14 @@ def main():
             if st.button("📉 同型K线", width='stretch', key="nav_kline_similarity", help="输入一只股票和时间范围，从主板检索近期同类型K线"):
                 st.session_state.show_kline_similarity = True
                 for key in ['show_history', 'show_monitor', 'show_config', 'show_main_force',
-                           'show_sector_strategy', 'show_portfolio', 'show_smart_monitor', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_longhubang', 'show_theme_peer']:
+                           'show_sector_strategy', 'show_portfolio', 'show_smart_monitor', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_longhubang', 'show_theme_peer', 'show_bottom_volume_arbitrage']:
+                    if key in st.session_state:
+                        del st.session_state[key]
+
+            if st.button("🟢 底部放量套利", width='stretch', key="nav_bottom_volume_arbitrage", help="按底部放量+回踩不破1/3+缩量规则筛选主板标的"):
+                st.session_state.show_bottom_volume_arbitrage = True
+                for key in ['show_history', 'show_monitor', 'show_config', 'show_main_force',
+                           'show_sector_strategy', 'show_portfolio', 'show_smart_monitor', 'show_low_price_bull', 'show_news_flow', 'show_macro_analysis', 'show_longhubang', 'show_theme_peer', 'show_kline_similarity']:
                     if key in st.session_state:
                         del st.session_state[key]
             
@@ -574,6 +581,11 @@ def main():
     # 检查是否显示同型K线检索
     if 'show_kline_similarity' in st.session_state and st.session_state.show_kline_similarity:
         _display_kline_similarity_page()
+        return
+
+    # 检查是否显示底部放量套利
+    if 'show_bottom_volume_arbitrage' in st.session_state and st.session_state.show_bottom_volume_arbitrage:
+        _display_bottom_volume_arbitrage_page()
         return
 
     # 检查是否显示AI盯盘
@@ -870,6 +882,137 @@ def _infer_query_trade_date(stock_data) -> str:
 
 
 
+def _display_bottom_volume_arbitrage_page():
+    st.markdown(
+        """
+    <div class="top-nav">
+        <h1 class="nav-title">🟢 底部放量套利</h1>
+        <p class="nav-subtitle">按底部放量大阳线、回踩不破1/3、缩量回调筛选主板标的</p>
+    </div>
+    """,
+        unsafe_allow_html=True,
+    )
+
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        end_date = st.date_input(
+            "结束日期",
+            value=st.session_state.get("bottom_volume_end_date", datetime.now().date()),
+            key="bottom_volume_end_date_page",
+        )
+    with col2:
+        max_candidates = st.number_input("扫描上限(0=全主板)", min_value=0, max_value=10000, value=0, step=100, key="bottom_volume_max_candidates_page")
+    with col3:
+        top_n = st.slider("返回数量", min_value=5, max_value=50, value=20, step=1, key="bottom_volume_topn_page")
+
+    p1, p2, p3, p4, p5, p6, p7 = st.columns(7)
+    with p1:
+        breakout_min_vol_multiple = st.number_input("倍量阈值", min_value=1.2, max_value=4.0, value=1.8, step=0.1, key="bottom_volume_param_vol")
+    with p2:
+        breakout_min_body_pct = st.number_input("阳线实体%", min_value=1.0, max_value=12.0, value=6.0, step=0.5, key="bottom_volume_param_body")
+    with p3:
+        pullback_max_retrace = st.number_input("回撤上限", min_value=0.1, max_value=0.9, value=0.6, step=0.01, key="bottom_volume_param_retrace")
+    with p4:
+        pullback_max_vol_ratio = st.number_input("回踩量比上限", min_value=0.2, max_value=1.0, value=0.5, step=0.05, key="bottom_volume_param_pullback_vol")
+    with p5:
+        best_vol_ratio = st.number_input("最佳量比", min_value=0.2, max_value=0.6, value=0.333, step=0.01, key="bottom_volume_param_best")
+    with p6:
+        hotspot_weight = st.number_input("热点权重", min_value=0.0, max_value=2.0, value=0.8, step=0.1, key="bottom_volume_param_hot_weight")
+    with p7:
+        bottom_lookback_days = st.number_input("底部参考天数", min_value=20, max_value=180, value=60, step=5, key="bottom_volume_param_lookback_days")
+
+    run_col1, run_col2 = st.columns([1, 1])
+    with run_col1:
+        run = st.button("🚀 开始筛选", type="primary", width='stretch', key="bottom_volume_run_page")
+    with run_col2:
+        clear = st.button("🧹 清空结果", width='stretch', key="bottom_volume_clear_page")
+
+    if clear:
+        st.session_state.pop("bottom_volume_result", None)
+        st.rerun()
+
+    if run:
+        st.session_state["bottom_volume_end_date"] = end_date
+        with st.spinner("正在执行底部放量套利筛选，请稍候..."):
+            selector = ThemePeerSelector()
+            result = selector.recommend_bottom_volume_arbitrage(
+                end_date=str(end_date),
+                top_n=int(top_n),
+                max_candidates=int(max_candidates),
+                breakout_min_vol_multiple=float(breakout_min_vol_multiple),
+                breakout_min_body_pct=float(breakout_min_body_pct),
+                pullback_max_retrace=float(pullback_max_retrace),
+                pullback_max_vol_ratio=float(pullback_max_vol_ratio),
+                best_vol_ratio=float(best_vol_ratio),
+                hotspot_weight=float(hotspot_weight),
+                bottom_lookback_days=int(bottom_lookback_days),
+            )
+            st.session_state["bottom_volume_result"] = result
+
+    if "bottom_volume_result" in st.session_state:
+        _render_bottom_volume_arbitrage_result(st.session_state.get("bottom_volume_result", {}) or {})
+
+
+def _render_bottom_volume_arbitrage_result(result: dict):
+    st.markdown("#### 📋 底部放量套利结果")
+    if not result.get("success"):
+        st.warning(f"筛选未成功: {result.get('error', '未知错误')}")
+        return
+
+    latest_trade_date = str(result.get("latest_trade_date", "") or "")
+    scanned = int(result.get("scanned", 0) or 0)
+    valid = int(result.get("valid", 0) or 0)
+    rows = list(result.get("candidates", []) or [])
+
+    st.caption(f"最新交易日: {latest_trade_date} | 扫描: {scanned} | 命中: {valid}")
+    st.caption("排序口径: 形态信号分 + 龙虎榜热点加权")
+    if result.get("price_adjustment_mode"):
+        st.caption(f"价格口径: {result.get('price_adjustment_mode')}")
+
+    sync_meta = result.get("kline_cache_sync") or {}
+    if isinstance(sync_meta, dict) and sync_meta:
+        st.caption(
+            "缓存同步: "
+            f"模式={sync_meta.get('mode', '')} | "
+            f"请求交易日={sync_meta.get('requested_trade_dates', 0)} | "
+            f"跳过交易日={sync_meta.get('skipped_trade_dates', 0)} | "
+            f"回补因子交易日={sync_meta.get('refill_adj_factor_dates', 0)} | "
+            f"已写入={sync_meta.get('written_rows', 0)}"
+        )
+
+    if not rows:
+        st.info("当前没有命中规则的标的")
+        return
+
+    table = pd.DataFrame(rows)
+    col_map = {
+        "rank": "排名",
+        "symbol": "代码",
+        "name": "名称",
+        "signal_score": "形态分",
+        "hot_themes": "热点题材",
+        "history_themes": "历史题材",
+        "hot_theme_max_score": "题材热度",
+        "hot_theme_boost": "热点加分",
+        "final_score": "综合分",
+        "breakout_date": "放量阳线日期",
+        "breakout_vol_multiple": "突破量倍",
+        "breakout_body_pct": "阳线实体%",
+        "pullback_retrace_ratio": "回撤比例",
+        "pullback_vol_ratio": "回踩量比",
+        "best_ratio_gap": "距1/3偏差",
+        "latest_close": "最新价",
+        "reason": "说明",
+    }
+    table = table.rename(columns=col_map)
+    if "热点题材" in table.columns:
+        table["热点题材"] = table["热点题材"].apply(lambda x: "、".join(x[:3]) if isinstance(x, list) else str(x or ""))
+    if "历史题材" in table.columns:
+        table["历史题材"] = table["历史题材"].apply(lambda x: "、".join(x[:5]) if isinstance(x, list) else str(x or ""))
+    show_cols = [c for c in ["排名", "代码", "名称", "综合分", "形态分", "热点加分", "题材热度", "热点题材", "历史题材", "放量阳线日期", "突破量倍", "阳线实体%", "回撤比例", "回踩量比", "距1/3偏差", "最新价", "说明"] if c in table.columns]
+    st.dataframe(table[show_cols], use_container_width=True, height=420)
+
+
 def _display_kline_similarity_page():
     st.markdown(
         """
@@ -906,15 +1049,36 @@ def _display_kline_similarity_page():
     with col3:
         top_n = st.slider("返回数量", min_value=5, max_value=30, value=15, step=1, key="kline_similarity_topn_page")
 
-    run_col1, run_col2 = st.columns([1, 1])
+    run_col1, run_col2, run_col3 = st.columns([1, 1, 1])
     with run_col1:
         run = st.button("🚀 开始检索", type="primary", width='stretch', key="kline_similarity_run_page")
     with run_col2:
+        sync_cache = st.button("🔄 同步K线缓存", width='stretch', key="kline_similarity_sync_cache_page")
+    with run_col3:
         clear = st.button("🧹 清空结果", width='stretch', key="kline_similarity_clear_page")
 
     if clear:
         st.session_state.pop("kline_similarity_result", None)
         st.rerun()
+
+    if sync_cache:
+        sync_start = min_date
+        sync_end = datetime.now().date()
+        with st.spinner("正在同步主板K线缓存，请稍候..."):
+            selector = ThemePeerSelector()
+            sync_meta = selector.sync_mainboard_kline_cache(
+                start_date=sync_start.strftime("%Y-%m-%d"),
+                end_date=sync_end.strftime("%Y-%m-%d"),
+                full_refresh=False,
+            )
+        st.session_state["kline_similarity_last_sync_meta"] = sync_meta
+        st.success(
+            "缓存同步完成: "
+            f"模式={sync_meta.get('mode', '')} | "
+            f"请求交易日={sync_meta.get('requested_trade_dates', 0)} | "
+            f"跳过交易日={sync_meta.get('skipped_trade_dates', 0)} | "
+            f"已写入={sync_meta.get('written_rows', 0)}"
+        )
 
     if run:
         if not symbol.strip():
@@ -936,6 +1100,18 @@ def _display_kline_similarity_page():
                 )
                 st.session_state["kline_similarity_result"] = sim_result
 
+    sync_meta = st.session_state.get("kline_similarity_last_sync_meta") or {}
+    if isinstance(sync_meta, dict) and sync_meta:
+        st.caption(
+            "最近手动同步: "
+            f"模式={sync_meta.get('mode', '')} | "
+            f"请求交易日={sync_meta.get('requested_trade_dates', 0)} | "
+            f"跳过交易日={sync_meta.get('skipped_trade_dates', 0)} | "
+            f"已写入={sync_meta.get('written_rows', 0)} | "
+            f"同步股票={sync_meta.get('synced_symbols', 0)} | "
+            f"失败={sync_meta.get('error_symbols', 0)}"
+        )
+
     if "kline_similarity_result" in st.session_state:
         _render_kline_similarity_result(st.session_state.get("kline_similarity_result", {}) or {})
 
@@ -950,6 +1126,8 @@ def _render_kline_similarity_result(result: dict):
     target_name = str(result.get("target_name", "") or "")
     start_date = str(result.get("start_date", "") or "")
     end_date = str(result.get("end_date", "") or "")
+    latest_trade_date = str(result.get("latest_trade_date", "") or "")
+    excluded_not_latest_count = int(result.get("excluded_not_latest_count", 0) or 0)
     scanned = int(result.get("scanned", 0) or 0)
     valid = int(result.get("valid", 0) or 0)
     rows = list(result.get("candidates", []) or [])
@@ -959,6 +1137,13 @@ def _render_kline_similarity_result(result: dict):
     )
     if result.get("compare_mode"):
         st.caption("对比模式: 目标使用所选区间；候选使用最新同长度窗口")
+    adjust_mode = str(result.get("price_adjustment_mode", "") or "")
+    if adjust_mode:
+        st.caption(f"价格口径: {adjust_mode}")
+    if latest_trade_date:
+        st.caption(f"市场最新交易日: {latest_trade_date}")
+    if excluded_not_latest_count > 0:
+        st.caption(f"已剔除窗口末端未对齐最新交易日的候选: {excluded_not_latest_count}")
 
     sync_meta = result.get("kline_cache_sync") or {}
     if isinstance(sync_meta, dict) and sync_meta:
@@ -992,9 +1177,10 @@ def _render_kline_similarity_result(result: dict):
         "change_pct": "区间涨跌%",
         "latest_change_pct": "最近涨跌%",
         "vol_ratio": "量比",
+        "candidate_window_end": "候选窗口末端",
     }
     table = table.rename(columns=col_map)
-    show_cols = [c for c in ["排名", "代码", "名称", "相似度", "形态路径", "特征相关", "特征距离", "趋势阶段", "区间涨跌%", "最近涨跌%", "量比"] if c in table.columns]
+    show_cols = [c for c in ["排名", "代码", "名称", "相似度", "形态路径", "特征相关", "特征距离", "趋势阶段", "区间涨跌%", "最近涨跌%", "量比", "候选窗口末端"] if c in table.columns]
     st.dataframe(table[show_cols], use_container_width=True, height=360)
 
 
