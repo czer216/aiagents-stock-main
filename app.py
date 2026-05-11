@@ -284,9 +284,19 @@ def _require_admin() -> bool:
 
 
 def _auth_logout():
-    for key in ["auth_logged_in", "auth_user_id", "auth_username", "auth_role", "auth_login_at"]:
+    token = str(st.session_state.get("auth_session_token", "") or "")
+    if token:
+        try:
+            auth_db.revoke_session(token)
+        except Exception:
+            pass
+    for key in ["auth_logged_in", "auth_user_id", "auth_username", "auth_role", "auth_login_at", "auth_session_token"]:
         if key in st.session_state:
             del st.session_state[key]
+    try:
+        st.query_params.clear()
+    except Exception:
+        pass
     st.rerun()
 
 
@@ -296,6 +306,27 @@ def _auth_set_user(user: dict):
     st.session_state["auth_username"] = str(user.get("username") or "")
     st.session_state["auth_role"] = str(user.get("role") or "user")
     st.session_state["auth_login_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _restore_auth_from_query_token() -> bool:
+    if _auth_logged_in():
+        return True
+    try:
+        token = str(st.query_params.get("session", "") or "")
+    except Exception:
+        token = ""
+    if not token:
+        return False
+    user = auth_db.get_user_by_session(token)
+    if not user:
+        try:
+            st.query_params.clear()
+        except Exception:
+            pass
+        return False
+    _auth_set_user(user)
+    st.session_state["auth_session_token"] = token
+    return True
 
 
 def _display_bootstrap_admin_page():
@@ -356,6 +387,12 @@ def _display_login_page():
         return
 
     _auth_set_user(user)
+    try:
+        token = auth_db.create_session(int(user.get("id") or 0), days=7)
+        st.session_state["auth_session_token"] = token
+        st.query_params["session"] = token
+    except Exception:
+        pass
     st.success(f"登录成功，欢迎 {user.get('username', '')}")
     time.sleep(0.6)
     st.rerun()
@@ -366,6 +403,7 @@ def main():
         _display_bootstrap_admin_page()
         return
 
+    _restore_auth_from_query_token()
     if not _auth_logged_in():
         _display_login_page()
         return

@@ -3,7 +3,8 @@ import hashlib
 import hmac
 import os
 import sqlite3
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 
@@ -34,6 +35,18 @@ class AuthDatabase:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 last_login_at TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                revoked INTEGER NOT NULL DEFAULT 0,
+                FOREIGN KEY (user_id) REFERENCES users(id)
             )
             """
         )
@@ -124,6 +137,63 @@ class AuthDatabase:
         ).fetchall()
         conn.close()
         return [dict(r) for r in rows]
+
+    def create_session(self, user_id: int, days: int = 7) -> str:
+        uid = int(user_id or 0)
+        if uid <= 0:
+            raise ValueError("无效用户")
+        now = datetime.now()
+        expires = now + timedelta(days=max(1, int(days or 7)))
+        token = secrets.token_urlsafe(48)
+        conn = self._get_connection()
+        conn.execute(
+            """
+            INSERT INTO user_sessions (token, user_id, created_at, expires_at, revoked)
+            VALUES (?, ?, ?, ?, 0)
+            """,
+            (
+                token,
+                uid,
+                now.strftime("%Y-%m-%d %H:%M:%S"),
+                expires.strftime("%Y-%m-%d %H:%M:%S"),
+            ),
+        )
+        conn.commit()
+        conn.close()
+        return token
+
+    def get_user_by_session(self, token: str) -> Optional[Dict[str, Any]]:
+        tk = str(token or "").strip()
+        if not tk:
+            return None
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        conn = self._get_connection()
+        row = conn.execute(
+            """
+            SELECT u.id, u.username, u.role, u.is_active
+            FROM user_sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token = ?
+              AND s.revoked = 0
+              AND s.expires_at > ?
+              AND u.is_active = 1
+            LIMIT 1
+            """,
+            (tk, now_str),
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        return dict(row)
+
+    def revoke_session(self, token: str) -> None:
+        tk = str(token or "").strip()
+        if not tk:
+            return
+        conn = self._get_connection()
+        conn.execute("UPDATE user_sessions SET revoked=1 WHERE token=?", (tk,))
+        conn.commit()
+        conn.close()
 
     def _hash_password(self, password: str) -> str:
         iterations = 200000
