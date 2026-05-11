@@ -34,13 +34,20 @@ def _get_cookie_store() -> EncryptedCookieManager:
     return EncryptedCookieManager(prefix="stockapp_auth", password=str(config.DEEPSEEK_API_KEY or "stockapp-fallback-secret"))
 
 
-def _cookies_ready_or_none() -> EncryptedCookieManager:
+def _cookies_ready_or_none(max_wait_sec: float = 1.5, step_sec: float = 0.1) -> EncryptedCookieManager:
     try:
         cookies = _get_cookie_store()
-        if cookies.ready():
-            return cookies
     except Exception:
-        pass
+        return None
+
+    deadline = time.time() + max(0.0, float(max_wait_sec or 0.0))
+    while time.time() <= deadline:
+        try:
+            if cookies.ready():
+                return cookies
+        except Exception:
+            return None
+        time.sleep(max(0.01, float(step_sec or 0.1)))
     return None
 
 
@@ -335,9 +342,11 @@ def _restore_auth_from_cookie_token() -> bool:
     if _auth_logged_in():
         return True
 
-    cookies = _cookies_ready_or_none()
+    cookies = _cookies_ready_or_none(max_wait_sec=2.0)
     if cookies is None:
-        return False
+        st.info("正在恢复登录会话，请稍候...")
+        time.sleep(0.2)
+        st.rerun()
 
     token = str(cookies.get("session_token", "") or "")
     if not token:
