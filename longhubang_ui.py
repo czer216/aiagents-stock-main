@@ -10,6 +10,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import time
 import base64
+import traceback
 
 from longhubang_engine import LonghubangEngine
 from longhubang_pdf import LonghubangPDFGenerator
@@ -224,18 +225,31 @@ def display_analysis_tab():
             help="默认关闭：使用程序排序；开启后使用你选择的题材（最多3个）替代程序主线",
         )
     if load_candidates_btn:
-        with st.spinner("正在加载题材强度候选..."):
-            engine_for_preview = _get_longhubang_engine(model=config.DEFAULT_MODEL_NAME)
-            preview = engine_for_preview.get_concept_strength_candidates(
-                date=preview_date,
-                days=preview_days,
-                score_pool_source=score_pool_source,
-            )
-        if preview.get("data_success"):
-            st.session_state["longhubang_concept_candidates"] = preview.get("candidates", []) or []
-            st.success(f"已加载 {len(st.session_state['longhubang_concept_candidates'])} 个题材候选")
-        else:
-            st.warning(f"题材候选加载失败：{preview.get('error', '无可用数据')}")
+        started_at = time.time()
+        try:
+            with st.spinner("正在加载题材强度候选（云端可能耗时20-120秒）..."):
+                engine_for_preview = _get_longhubang_engine(model=config.DEFAULT_MODEL_NAME)
+                preview = engine_for_preview.get_concept_strength_candidates(
+                    date=preview_date,
+                    days=preview_days,
+                    score_pool_source=score_pool_source,
+                )
+            elapsed = time.time() - started_at
+            if preview.get("data_success"):
+                st.session_state["longhubang_concept_candidates"] = preview.get("candidates", []) or []
+                st.success(
+                    f"已加载 {len(st.session_state['longhubang_concept_candidates'])} 个题材候选，耗时 {elapsed:.1f}s"
+                )
+            else:
+                err = str(preview.get("error", "无可用数据") or "无可用数据")
+                nearest = str(preview.get("nearest_open_day", "") or "").strip()
+                if nearest:
+                    err = f"{err}（最近交易日：{nearest}）"
+                st.warning(f"题材候选加载失败：{err}，耗时 {elapsed:.1f}s")
+        except Exception as e:
+            elapsed = time.time() - started_at
+            st.error(f"题材候选加载异常：{str(e)}，耗时 {elapsed:.1f}s")
+            st.code(traceback.format_exc())
 
     if "longhubang_user_concept_scores" not in st.session_state:
         st.session_state["longhubang_user_concept_scores"] = {}

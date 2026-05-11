@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 import plotly.express as px
 import pandas as pd
@@ -26,6 +27,22 @@ from news_flow_ui import display_news_flow_monitor
 from theme_peer_ui import display_theme_peer_selector
 from theme_peer_selector import ThemePeerSelector
 from auth_db import auth_db
+from streamlit_cookies_manager import EncryptedCookieManager
+
+
+def _get_cookie_store() -> EncryptedCookieManager:
+    return EncryptedCookieManager(prefix="stockapp_auth", password=str(config.DEEPSEEK_API_KEY or "stockapp-fallback-secret"))
+
+
+def _cookies_ready_or_none() -> EncryptedCookieManager:
+    try:
+        cookies = _get_cookie_store()
+        if cookies.ready():
+            return cookies
+    except Exception:
+        pass
+    return None
+
 
 # 页面配置
 st.set_page_config(
@@ -290,13 +307,19 @@ def _auth_logout():
             auth_db.revoke_session(token)
         except Exception:
             pass
+
+    cookies = _cookies_ready_or_none()
+    if cookies is not None:
+        try:
+            if cookies.get("session_token"):
+                del cookies["session_token"]
+                cookies.save()
+        except Exception:
+            pass
+
     for key in ["auth_logged_in", "auth_user_id", "auth_username", "auth_role", "auth_login_at", "auth_session_token"]:
         if key in st.session_state:
             del st.session_state[key]
-    try:
-        st.query_params.clear()
-    except Exception:
-        pass
     st.rerun()
 
 
@@ -308,22 +331,27 @@ def _auth_set_user(user: dict):
     st.session_state["auth_login_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def _restore_auth_from_query_token() -> bool:
+def _restore_auth_from_cookie_token() -> bool:
     if _auth_logged_in():
         return True
-    try:
-        token = str(st.query_params.get("session", "") or "")
-    except Exception:
-        token = ""
+
+    cookies = _cookies_ready_or_none()
+    if cookies is None:
+        return False
+
+    token = str(cookies.get("session_token", "") or "")
     if not token:
         return False
+
     user = auth_db.get_user_by_session(token)
     if not user:
         try:
-            st.query_params.clear()
+            del cookies["session_token"]
+            cookies.save()
         except Exception:
             pass
         return False
+
     _auth_set_user(user)
     st.session_state["auth_session_token"] = token
     return True
@@ -390,7 +418,10 @@ def _display_login_page():
     try:
         token = auth_db.create_session(int(user.get("id") or 0), days=7)
         st.session_state["auth_session_token"] = token
-        st.query_params["session"] = token
+        cookies = _cookies_ready_or_none()
+        if cookies is not None:
+            cookies["session_token"] = token
+            cookies.save()
     except Exception:
         pass
     st.success(f"登录成功，欢迎 {user.get('username', '')}")
@@ -403,7 +434,7 @@ def main():
         _display_bootstrap_admin_page()
         return
 
-    _restore_auth_from_query_token()
+    _restore_auth_from_cookie_token()
     if not _auth_logged_in():
         _display_login_page()
         return
