@@ -1,0 +1,1554 @@
+"""
+龙虎榜热度补充信号（Tushare）
+1) 连板晋级热度：limit_step
+2) 同花顺A股热榜热度：ths_hot
+3) 最强概念板块：limit_cpt_list
+4) 开盘啦热度：kpl_list
+"""
+
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
+import re
+from typing import Any, Dict, List, Optional
+
+import pandas as pd
+
+from services.data_source_manager import data_source_manager
+from infrastructure.data.tushare_proxy_rate_limit import throttle_tushare_proxy_request, call_tushare_with_timeout
+from infrastructure.data.trade_calendar_service import TradeCalendarService
+
+
+class LimitStepHeatFetcher:
+    """基于 Tushare limit_step 的连板晋级热度"""
+
+    def __init__(self):
+        self.data_source_manager = data_source_manager
+        self.trade_calendar = TradeCalendarService()
+
+    def get_heat_data(
+        self,
+        days: int = 5,
+        end_date: Optional[str] = None,
+        exact_trade_date_only: bool = False,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "data_success": False,
+            "source": "tushare.limit_step",
+            "query_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "daily_step_stats": [],
+            "stock_step_heat_map": {},
+            "daily_step_concept_rankings": [],
+            "concept_step_strength_map": {},
+            "strongest_step_concepts": [],
+            "market_heat_summary": {},
+        }
+
+        pro = self.data_source_manager.tushare_api
+        if not self.data_source_manager.tushare_available or pro is None:
+            result["error"] = "Tushare不可用或未配置Token"
+            return result
+        if not hasattr(pro, "limit_step"):
+            result["error"] = "当前Tushare权限或版本不支持 limit_step"
+            return result
+
+        if exact_trade_date_only and end_date:
+            parsed = self._parse_date(end_date)
+            trading_dates = [parsed.strftime("%Y%m%d")] if parsed else []
+        else:
+            trading_dates = self._build_recent_trade_dates(days=max(days, 3), end_date=end_date)
+        if not trading_dates:
+            result["error"] = "未生成有效交易日"
+            return result
+
+        all_days: Dict[str, pd.DataFrame] = {}
+        range_df = self._fetch_range_data(
+            trading_dates[-1],
+            trading_dates[0],
+            query_date=trading_dates[0],
+        )
+        if range_df is not None and not range_df.empty:
+            date_col = self._find_col(range_df, ["trade_date", "日期", "date"])
+            if date_col:
+                for trade_date, group in range_df.groupby(date_col):
+                    key = self._norm_trade_date(trade_date)
+                    if key:
+                        all_days[key] = group.copy()
+
+        for trade_date in trading_dates:
+            if trade_date in all_days:
+                continue
+            day_df = self._fetch_single_day_data(trade_date)
+            if day_df is not None and not day_df.empty:
+                all_days[trade_date] = day_df
+
+        daily_stats: List[Dict[str, Any]] = []
+        daily_step_map: Dict[str, Dict[str, int]] = {}
+        per_stock_daily: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        daily_concept_rankings: List[Dict[str, Any]] = []
+        for trade_date in trading_dates:
+            day_df = all_days.get(trade_date)
+            records = self._extract_step_records(day_df)
+            if not records:
+                continue
+            day_step_dict = {x["code"]: int(x["step"]) for x in records}
+            daily_step_map[trade_date] = day_step_dict
+            max_step = max([x["step"] for x in records]) if records else 0
+            promote_count = sum(1 for x in records if x["step"] >= 2)
+            hot_count = sum(1 for x in records if x["step"] >= 3)
+            day_concept_weights: Dict[str, float] = defaultdict(float)
+            for rec in records:
+                concepts = rec.get("concepts", []) or []
+                for concept in concepts:
+                    day_concept_weights[concept] += float(rec["step"]) + 0.5
+            top_concepts = [
+                {"concept": concept, "score": round(score, 2)}
+                for concept, score in sorted(
+                    day_concept_weights.items(), key=lambda x: x[1], reverse=True
+                )[:10]
+            ]
+            day_item = {
+                "trade_date": self._fmt_trade_date(trade_date),
+                "max_step": int(max_step),
+                "promotion_count": int(promote_count),
+                "hot_stock_count": int(hot_count),
+                "advance_count": 0,
+                "advance_rate": 0.0,
+                "top_concepts": top_concepts[:5],
+                "top_stocks": records[:12],
+            }
+            daily_stats.append(day_item)
+            daily_concept_rankings.append(
+                {"trade_date": day_item["trade_date"], "top_concepts": top_concepts}
+            )
+            for rec in records:
+                per_stock_daily[rec["code"]].append(
+                    {
+                        "trade_date": trade_date,
+                        "step": rec["step"],
+                        "name": rec.get("name", ""),
+                        "concepts": rec.get("concepts", []) or [],
+                    }
+                )
+
+        if not daily_stats:
+            result["error"] = "未获取到可用的连板晋级数据"
+            return result
+
+        # 计算“晋级个数”：相邻交易日对比，连板高度提升的股票数量
+        stats_by_trade_date = {x["trade_date"]: x for x in daily_stats}
+        for idx, trade_date in enumerate(trading_dates):
+            cur_map = daily_step_map.get(trade_date, {})
+            if not cur_map:
+                continue
+            cur_key = self._fmt_trade_date(trade_date)
+            day_stat = stats_by_trade_date.get(cur_key)
+            if day_stat is None:
+                continue
+            if idx >= len(trading_dates) - 1:
+                continue
+            prev_date = trading_dates[idx + 1]
+            prev_map = daily_step_map.get(prev_date, {})
+            if not prev_map:
+                continue
+            comparable = [code for code in cur_map.keys() if code in prev_map]
+            if not comparable:
+                continue
+            advance_count = sum(1 for code in comparable if cur_map[code] > prev_map[code])
+            day_stat["advance_count"] = int(advance_count)
+            day_stat["advance_rate"] = round(advance_count / max(len(comparable), 1), 4)
+
+        latest_codes = set([x["code"] for x in daily_stats[0]["top_stocks"][:8]])
+        stock_map: Dict[str, Dict[str, Any]] = {}
+        for code, items in per_stock_daily.items():
+            items = sorted(items, key=lambda x: x["trade_date"], reverse=True)
+            max_step = max([x["step"] for x in items]) if items else 0
+            latest_step = items[0]["step"] if items else 0
+            promotion_days = sum(1 for x in items if x["step"] >= 2)
+            concept_counts = Counter()
+            for x in items:
+                for concept in (x.get("concepts", []) or []):
+                    concept_counts[concept] += 1
+            top_concepts = [k for k, _ in concept_counts.most_common(5)]
+            advance_days = 0
+            for i in range(len(items) - 1):
+                newer = items[i]["step"]
+                older = items[i + 1]["step"]
+                if newer > older:
+                    advance_days += 1
+            score = min(max_step / 6.0 * 1.4, 1.4)
+            score += min(promotion_days * 0.25, 0.5)
+            score += min(advance_days * 0.2, 0.4)
+            if code in latest_codes:
+                score += 0.1
+            stock_map[code] = {
+                "score": round(min(score, 2.0), 2),
+                "max_step": int(max_step),
+                "latest_step": int(latest_step),
+                "promotion_days": int(promotion_days),
+                "advance_days": int(advance_days),
+                "appear_days": len(items),
+                "concepts": top_concepts,
+                "latest_trade_date": self._fmt_trade_date(items[0]["trade_date"]) if items else "",
+                "name": items[0].get("name", "") if items else "",
+            }
+
+        concept_raw_scores: Dict[str, float] = defaultdict(float)
+        for day_idx, day_item in enumerate(daily_concept_rankings):
+            decay = max(0.45, 1.0 - day_idx * 0.15)
+            for rank_idx, item in enumerate(day_item.get("top_concepts", [])[:8]):
+                concept = item.get("concept", "")
+                if not concept:
+                    continue
+                base_score = float(item.get("score", 0.0) or 0.0)
+                rank_weight = max(0.7, 2.8 - rank_idx * 0.3)
+                concept_raw_scores[concept] += base_score * rank_weight * decay
+
+        concept_step_strength_map: Dict[str, float] = {}
+        strongest_step_concepts: List[Dict[str, Any]] = []
+        if concept_raw_scores:
+            max_raw = max(concept_raw_scores.values()) or 1.0
+            concept_step_strength_map = {
+                concept: round(min(score / max_raw * 4.0, 4.0), 2)
+                for concept, score in concept_raw_scores.items()
+            }
+            sorted_step_concepts = sorted(
+                concept_step_strength_map.items(), key=lambda x: x[1], reverse=True
+            )
+            strongest_step_concepts = [
+                {"concept": concept, "score": score} for concept, score in sorted_step_concepts[:10]
+            ]
+
+        avg_max_step = sum(x["max_step"] for x in daily_stats) / max(len(daily_stats), 1)
+        avg_promote = sum(x["promotion_count"] for x in daily_stats) / max(len(daily_stats), 1)
+        avg_advance = sum(x.get("advance_count", 0) for x in daily_stats) / max(len(daily_stats), 1)
+        latest_advance = daily_stats[0].get("advance_count", 0)
+        if avg_max_step >= 5:
+            heat_level = "高热（高标带动）"
+        elif avg_max_step >= 3:
+            heat_level = "中热（结构活跃）"
+        else:
+            heat_level = "偏冷（晋级不足）"
+
+        result.update(
+            {
+                "data_success": True,
+                "daily_step_stats": daily_stats,
+                "stock_step_heat_map": stock_map,
+                "daily_step_concept_rankings": daily_concept_rankings,
+                "concept_step_strength_map": concept_step_strength_map,
+                "strongest_step_concepts": strongest_step_concepts,
+                "market_heat_summary": {
+                    "days": len(daily_stats),
+                    "avg_max_step": round(avg_max_step, 2),
+                    "avg_promotion_count": round(avg_promote, 2),
+                    "avg_advance_count": round(avg_advance, 2),
+                    "latest_advance_count": int(latest_advance),
+                    "strongest_step_concept": strongest_step_concepts[0]["concept"] if strongest_step_concepts else "",
+                    "heat_level": heat_level,
+                },
+            }
+        )
+        return result
+
+    def _fetch_range_data(
+        self, start_date: str, end_date: str, query_date: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
+        pro = self.data_source_manager.tushare_api
+        candidates = [
+            {"trade_date": query_date, "limit_type": "U"} if query_date else {},
+            {"trade_date": query_date} if query_date else {},
+            {"start_date": start_date, "end_date": end_date, "limit_type": "U"},
+            {"start_date": start_date, "end_date": end_date},
+        ]
+        for kwargs in candidates:
+            if not kwargs:
+                continue
+            try:
+                throttle_tushare_proxy_request("limit_step")
+                df = pro.limit_step(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return None
+
+    def _fetch_single_day_data(self, trade_date: str) -> Optional[pd.DataFrame]:
+        pro = self.data_source_manager.tushare_api
+        candidates = [{"trade_date": trade_date}, {"date": trade_date}]
+        for kwargs in candidates:
+            try:
+                throttle_tushare_proxy_request("limit_step")
+                df = pro.limit_step(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return None
+
+    def _extract_step_records(self, df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
+        if df is None or df.empty:
+            return []
+        code_col = self._find_col(df, ["ts_code", "code", "股票代码", "证券代码"])
+        if not code_col:
+            return []
+        name_col = self._find_col(df, ["name", "股票名称", "简称"])
+        step_col = self._find_col(df, ["step", "连板", "板数", "高度", "梯队"])
+        concept_col = self._find_col(df, ["cpt_name", "concept", "概念", "题材", "板块"])
+
+        rows: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            code = self._normalize_code(row.get(code_col))
+            if not code:
+                continue
+            name = self._clean_text(row.get(name_col)) if name_col else ""
+            step = int(round(self._safe_number(row.get(step_col)))) if step_col else 0
+            if step <= 0:
+                step = self._infer_step_from_row(row)
+            if step <= 0:
+                continue
+            concepts = self._parse_concepts_from_row(row, concept_col)
+            rows.append({"code": code, "name": name, "step": step, "concepts": concepts})
+
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for item in rows:
+            old = dedup.get(item["code"])
+            if old is None or item["step"] > old["step"]:
+                dedup[item["code"]] = item
+            elif old is not None and item["step"] == old["step"]:
+                merged = set(old.get("concepts", []) or [])
+                merged.update(item.get("concepts", []) or [])
+                old["concepts"] = list(merged)[:8]
+
+        out = list(dedup.values())
+        out.sort(key=lambda x: x["step"], reverse=True)
+        return out[:50]
+
+    def _infer_step_from_row(self, row: pd.Series) -> int:
+        for value in row.values:
+            text = self._clean_text(value)
+            if not text:
+                continue
+            match = re.search(r"(\d+)\s*连板", text)
+            if match:
+                return int(match.group(1))
+            match = re.search(r"(\d+)\s*板", text)
+            if match:
+                return int(match.group(1))
+        return 0
+
+    def _build_recent_trade_dates(self, days: int, end_date: Optional[str] = None) -> List[str]:
+        end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        return self.trade_calendar.recent_open_days(end8, max(int(days or 0), 1))
+
+    def _find_col(self, df: pd.DataFrame, keywords: List[str]) -> str:
+        for col in df.columns:
+            name = str(col).lower()
+            if any(k.lower() in name for k in keywords):
+                return col
+        return ""
+
+    def _parse_concepts_from_row(self, row: pd.Series, concept_col: str) -> List[str]:
+        if concept_col:
+            return self._split_concepts(row.get(concept_col))
+        return []
+
+    def _split_concepts(self, raw: Any) -> List[str]:
+        text = self._clean_text(raw)
+        if not text:
+            return []
+        parts = re.split(r"[,，;；/|、\s]+", text)
+        out: List[str] = []
+        noise = {"概念", "题材", "板块", "-", "--", "N/A", "None", "nan"}
+        for part in parts:
+            concept = self._clean_text(part)
+            if not concept:
+                continue
+            if concept in noise or len(concept) < 2 or concept.isdigit():
+                continue
+            out.append(concept)
+        dedup: List[str] = []
+        seen = set()
+        for concept in out:
+            if concept not in seen:
+                seen.add(concept)
+                dedup.append(concept)
+        return dedup[:8]
+
+    def _safe_number(self, value: Any) -> float:
+        if value is None:
+            return 0.0
+        text = str(value).strip().replace(",", "")
+        if not text or text.lower() == "nan":
+            return 0.0
+        m = re.search(r"[-+]?\d*\.?\d+", text)
+        if not m:
+            return 0.0
+        try:
+            return float(m.group())
+        except Exception:
+            return 0.0
+
+    def _clean_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        return "" if text.lower() == "nan" else re.sub(r"\s+", " ", text)
+
+    def _normalize_code(self, value: Any) -> str:
+        text = self._clean_text(value)
+        if not text:
+            return ""
+        if "." in text:
+            base, suffix = text.split(".", 1)
+            suffix = suffix.upper()
+            if suffix not in ("SH", "SZ"):
+                return ""
+            if len(base) == 6 and base.isdigit():
+                return base
+            return ""
+        if len(text) == 6 and text.isdigit() and text[0] in ("0", "3", "6"):
+            return text
+        return ""
+
+    def _parse_date(self, value: str) -> Optional[datetime]:
+        if not value:
+            return None
+        text = str(value).strip()
+        for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(text, fmt)
+            except Exception:
+                continue
+        return None
+
+    def _norm_trade_date(self, value: Any) -> str:
+        text = self._clean_text(value)
+        parsed = self._parse_date(text)
+        if parsed:
+            return parsed.strftime("%Y%m%d")
+        m = re.search(r"(\d{8})", text)
+        return m.group(1) if m else ""
+
+    def _fmt_trade_date(self, trade_date: str) -> str:
+        if not trade_date or len(trade_date) != 8:
+            return trade_date
+        return f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+
+
+class THSHotHeatFetcher:
+    """基于 Tushare ths_hot 的A股热榜热度"""
+
+    def __init__(self):
+        self.data_source_manager = data_source_manager
+        self.trade_calendar = TradeCalendarService()
+
+    def get_hot_data(
+        self,
+        days: int = 3,
+        end_date: Optional[str] = None,
+        exact_trade_date_only: bool = False,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "data_success": False,
+            "source": "tushare.ths_hot",
+            "query_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "daily_hot_stats": [],
+            "stock_hot_map": {},
+            "hot_summary": {},
+        }
+
+        pro = self.data_source_manager.tushare_api
+        if not self.data_source_manager.tushare_available or pro is None:
+            result["error"] = "Tushare不可用或未配置Token"
+            return result
+        if not hasattr(pro, "ths_hot"):
+            result["error"] = "当前Tushare权限或版本不支持 ths_hot"
+            return result
+
+        if exact_trade_date_only and end_date:
+            parsed = self._parse_date(end_date)
+            trading_dates = [parsed.strftime("%Y%m%d")] if parsed else []
+        else:
+            trading_dates = self._build_recent_trade_dates(days=max(days, 2), end_date=end_date)
+        if not trading_dates:
+            result["error"] = "未生成有效交易日"
+            return result
+
+        all_days: Dict[str, pd.DataFrame] = {}
+        range_df = self._fetch_range_data(
+            trading_dates[-1],
+            trading_dates[0],
+            query_date=trading_dates[0],
+        )
+        if range_df is not None and not range_df.empty:
+            date_col = self._find_col(range_df, ["trade_date", "日期", "date"])
+            if date_col:
+                for trade_date, group in range_df.groupby(date_col):
+                    key = self._norm_trade_date(trade_date)
+                    if key:
+                        all_days[key] = group.copy()
+
+        for trade_date in trading_dates:
+            if trade_date in all_days:
+                continue
+            day_df = self._fetch_single_day_data(trade_date)
+            if day_df is not None and not day_df.empty:
+                all_days[trade_date] = day_df
+
+        daily_hot_stats: List[Dict[str, Any]] = []
+        per_stock: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for trade_date in trading_dates:
+            day_df = all_days.get(trade_date)
+            records = self._extract_hot_records(day_df)
+            if not records:
+                continue
+            daily_hot_stats.append(
+                {
+                    "trade_date": self._fmt_trade_date(trade_date),
+                    "top_hot": records[:10],
+                }
+            )
+            for rec in records:
+                per_stock[rec["code"]].append(
+                    {
+                        "trade_date": trade_date,
+                        "rank": rec.get("rank", 9999),
+                        "hot_value": rec.get("hot_value", 0.0),
+                        "name": rec.get("name", ""),
+                    }
+                )
+
+        if not daily_hot_stats:
+            result["error"] = "未获取到可用的同花顺A股热榜数据"
+            return result
+
+        stock_hot_map: Dict[str, Dict[str, Any]] = {}
+        all_hot_values = []
+        for code, items in per_stock.items():
+            items = sorted(items, key=lambda x: x["trade_date"], reverse=True)
+            best_rank = min([x["rank"] for x in items])
+            latest_rank = items[0]["rank"]
+            appear_days = len(items)
+            avg_hot = (
+                sum(x["hot_value"] for x in items if x.get("hot_value", 0) > 0)
+                / max(sum(1 for x in items if x.get("hot_value", 0) > 0), 1)
+            )
+            if avg_hot > 0:
+                all_hot_values.append(avg_hot)
+
+            score = self._rank_to_score(best_rank)
+            score += min(appear_days * 0.07, 0.2)
+            stock_hot_map[code] = {
+                "score": round(min(score, 1.0), 2),
+                "best_rank": int(best_rank),
+                "latest_rank": int(latest_rank),
+                "appear_days": int(appear_days),
+                "avg_hot": round(avg_hot, 2),
+                "name": items[0].get("name", ""),
+            }
+
+        top_today = daily_hot_stats[0]["top_hot"][:5] if daily_hot_stats else []
+        result.update(
+            {
+                "data_success": True,
+                "daily_hot_stats": daily_hot_stats,
+                "stock_hot_map": stock_hot_map,
+                "hot_summary": {
+                    "days": len(daily_hot_stats),
+                    "tracked_stocks": len(stock_hot_map),
+                    "avg_hot_value": round(sum(all_hot_values) / max(len(all_hot_values), 1), 2) if all_hot_values else 0.0,
+                    "top_today": top_today,
+                },
+            }
+        )
+        return result
+
+    def _fetch_range_data(
+        self, start_date: str, end_date: str, query_date: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
+        pro = self.data_source_manager.tushare_api
+        candidates = [
+            {"trade_date": query_date, "market": "热股"} if query_date else {},
+            {"date": query_date, "market": "热股"} if query_date else {},
+            {"start_date": start_date, "end_date": end_date},
+            {"start_date": start_date, "end_date": end_date, "market": "热股"},
+        ]
+        for kwargs in candidates:
+            if not kwargs:
+                continue
+            try:
+                throttle_tushare_proxy_request("ths_hot")
+                df = pro.ths_hot(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return None
+
+    def _fetch_single_day_data(self, trade_date: str) -> Optional[pd.DataFrame]:
+        pro = self.data_source_manager.tushare_api
+        candidates = [
+            {"trade_date": trade_date, "market": "热股"},
+            {"trade_date": trade_date},
+            {"date": trade_date, "market": "热股"},
+            {"date": trade_date},
+        ]
+        for kwargs in candidates:
+            try:
+                throttle_tushare_proxy_request("ths_hot")
+                df = pro.ths_hot(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return None
+
+    def _extract_hot_records(self, df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
+        if df is None or df.empty:
+            return []
+
+        code_col = self._find_col(df, ["ts_code", "股票代码", "code", "证券代码"])
+        if not code_col:
+            return []
+        name_col = self._find_col(df, ["name", "股票名称", "简称"])
+        rank_col = self._find_col(df, ["rank", "排名", "hot_rank"])
+        hot_col = self._find_col(df, ["hot", "热度", "heat", "指数"])
+
+        rows: List[Dict[str, Any]] = []
+        for _, row in df.iterrows():
+            code = self._normalize_code(row.get(code_col))
+            if not code:
+                continue
+            name = self._clean_text(row.get(name_col)) if name_col else ""
+            rank = int(round(self._safe_number(row.get(rank_col)))) if rank_col else 9999
+            if rank <= 0:
+                rank = 9999
+            hot_value = self._safe_number(row.get(hot_col)) if hot_col else 0.0
+            rows.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "rank": rank,
+                    "hot_value": round(hot_value, 2),
+                }
+            )
+
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for item in rows:
+            old = dedup.get(item["code"])
+            if old is None or item["rank"] < old["rank"]:
+                dedup[item["code"]] = item
+
+        out = list(dedup.values())
+        out.sort(key=lambda x: (x["rank"], -x.get("hot_value", 0.0)))
+        return out[:80]
+
+    def _rank_to_score(self, rank: int) -> float:
+        if rank <= 10:
+            return 0.8
+        if rank <= 30:
+            return 0.6
+        if rank <= 50:
+            return 0.45
+        if rank <= 100:
+            return 0.3
+        return 0.15
+
+    def _build_recent_trade_dates(self, days: int, end_date: Optional[str] = None) -> List[str]:
+        end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        return self.trade_calendar.recent_open_days(end8, max(int(days or 0), 1))
+
+    def _find_col(self, df: pd.DataFrame, keywords: List[str]) -> str:
+        for col in df.columns:
+            name = str(col).lower()
+            if any(k.lower() in name for k in keywords):
+                return col
+        return ""
+
+    def _safe_number(self, value: Any) -> float:
+        if value is None:
+            return 0.0
+        text = str(value).strip().replace(",", "")
+        if not text or text.lower() == "nan":
+            return 0.0
+        m = re.search(r"[-+]?\d*\.?\d+", text)
+        if not m:
+            return 0.0
+        try:
+            return float(m.group())
+        except Exception:
+            return 0.0
+
+    def _clean_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        return "" if text.lower() == "nan" else re.sub(r"\s+", " ", text)
+
+    def _normalize_code(self, value: Any) -> str:
+        text = self._clean_text(value)
+        if not text:
+            return ""
+        if "." in text:
+            base, suffix = text.split(".", 1)
+            suffix = suffix.upper()
+            if suffix not in ("SH", "SZ"):  # 仅A股
+                return ""
+            if len(base) == 6 and base.isdigit() and base[0] in ("0", "3", "6"):
+                return base
+            return ""
+        if len(text) == 6 and text.isdigit() and text[0] in ("0", "3", "6"):
+            return text
+        return ""
+
+    def _parse_date(self, value: str) -> Optional[datetime]:
+        if not value:
+            return None
+        text = str(value).strip()
+        for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(text, fmt)
+            except Exception:
+                continue
+        return None
+
+    def _norm_trade_date(self, value: Any) -> str:
+        text = self._clean_text(value)
+        parsed = self._parse_date(text)
+        if parsed:
+            return parsed.strftime("%Y%m%d")
+        m = re.search(r"(\d{8})", text)
+        return m.group(1) if m else ""
+
+    def _fmt_trade_date(self, trade_date: str) -> str:
+        if not trade_date or len(trade_date) != 8:
+            return trade_date
+        return f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+
+
+class KPLListHeatFetcher:
+    """基于 Tushare kpl_list 的开盘啦热度信号"""
+
+    def __init__(self):
+        self.data_source_manager = data_source_manager
+        self.trade_calendar = TradeCalendarService()
+
+    def get_heat_data(
+        self,
+        days: int = 3,
+        end_date: Optional[str] = None,
+        stock_codes: Optional[List[str]] = None,
+        exact_trade_date_only: bool = False,
+    ) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "data_success": False,
+            "source": "tushare.kpl_list",
+            "query_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "daily_kpl_stats": [],
+            "stock_kpl_map": {},
+            "theme_heat_map": {},
+            "kpl_summary": {},
+        }
+
+        pro = self.data_source_manager.tushare_api
+        if not self.data_source_manager.tushare_available or pro is None:
+            result["error"] = "Tushare不可用或未配置Token"
+            return result
+        if not hasattr(pro, "kpl_list"):
+            result["error"] = "当前Tushare权限或版本不支持 kpl_list"
+            return result
+
+        target_codes = self._normalize_codes(stock_codes or [])
+        if not target_codes:
+            result["error"] = "未提供龙虎榜股票代码，跳过 kpl_list 定向查询"
+            return result
+
+        if exact_trade_date_only and end_date:
+            parsed = self._parse_date(end_date)
+            trading_dates = [parsed.strftime("%Y%m%d")] if parsed else []
+        else:
+            trading_dates = self._build_recent_trade_dates(days=max(days, 2), end_date=end_date)
+        if not trading_dates:
+            result["error"] = "未生成有效交易日"
+            return result
+
+        target_codes_set = set(target_codes)
+        all_days: Dict[str, pd.DataFrame] = {}
+        for trade_date in trading_dates:
+            day_df = self._fetch_trade_date_snapshot(trade_date)
+            if day_df is not None and not day_df.empty:
+                all_days[trade_date] = day_df
+
+        daily_stats: List[Dict[str, Any]] = []
+        per_stock: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        theme_raw_scores: Dict[str, float] = defaultdict(float)
+        for day_idx, trade_date in enumerate(trading_dates):
+            day_df = all_days.get(trade_date)
+            all_records = self._extract_kpl_records(day_df)
+            if not all_records:
+                continue
+            records = [x for x in all_records if x.get("code") in target_codes_set]
+
+            decay = max(0.5, 1.0 - day_idx * 0.2)
+            day_theme_counter = Counter()
+            for rank_idx, rec in enumerate(records[:50]):
+                themes = rec.get("themes", []) or []
+                for theme in themes:
+                    day_theme_counter[theme] += 1
+                    rank_weight = max(0.5, 2.2 - rank_idx * 0.05)
+                    theme_raw_scores[theme] += rank_weight * decay
+                per_stock[rec["code"]].append(
+                    {
+                        "trade_date": trade_date,
+                        "rank": rec.get("rank", 9999),
+                        "change_pct": rec.get("change_pct", 0.0),
+                        "status": rec.get("status", ""),
+                        "themes": themes,
+                        "name": rec.get("name", ""),
+                    }
+                )
+
+            day_theme_counter_all = Counter()
+            for rec in all_records[:120]:
+                for theme in (rec.get("themes", []) or []):
+                    day_theme_counter_all[theme] += 1
+
+            top_themes = [
+                {"theme": theme, "count": int(count)}
+                for theme, count in day_theme_counter.most_common(10)
+            ]
+            top_themes_all = [
+                {"theme": theme, "count": int(count)}
+                for theme, count in day_theme_counter_all.most_common(20)
+            ]
+            daily_stats.append(
+                {
+                    "trade_date": self._fmt_trade_date(trade_date),
+                    "tracked_count": len(records),
+                    "tracked_count_all": len(all_records),
+                    "top_list": records[:12],
+                    "top_list_all": all_records[:30],
+                    "top_themes": top_themes,
+                    "top_themes_all": top_themes_all,
+                }
+            )
+
+        if not daily_stats:
+            result["error"] = "未获取到可用的 kpl_list 数据"
+            return result
+
+        theme_heat_map: Dict[str, float] = {}
+        if theme_raw_scores:
+            max_raw = max(theme_raw_scores.values()) or 1.0
+            theme_heat_map = {
+                k: round(min(v / max_raw * 4.0, 4.0), 2)
+                for k, v in sorted(theme_raw_scores.items(), key=lambda x: x[1], reverse=True)[:50]
+            }
+
+        # 计算个股KPL热度映射
+        tmp_rows: Dict[str, Dict[str, Any]] = {}
+        avg_chg_list: List[float] = []
+        for code, items in per_stock.items():
+            items = sorted(items, key=lambda x: x["trade_date"], reverse=True)
+            best_rank = min([int(x.get("rank", 9999) or 9999) for x in items])
+            latest_rank = int(items[0].get("rank", 9999) or 9999)
+            appear_days = len(items)
+            avg_chg = (
+                sum(float(x.get("change_pct", 0.0) or 0.0) for x in items)
+                / max(len(items), 1)
+            )
+            if avg_chg > 0:
+                avg_chg_list.append(avg_chg)
+            theme_counter = Counter()
+            for x in items:
+                for theme in (x.get("themes", []) or []):
+                    theme_counter[theme] += 1
+            tmp_rows[code] = {
+                "name": items[0].get("name", ""),
+                "best_rank": best_rank,
+                "latest_rank": latest_rank,
+                "appear_days": appear_days,
+                "avg_chg": round(avg_chg, 2),
+                "status": str(items[0].get("status", "") or "").strip(),
+                "themes": [t for t, _ in theme_counter.most_common(5)],
+            }
+
+        max_avg_chg = max(avg_chg_list) if avg_chg_list else 0.0
+        stock_kpl_map: Dict[str, Dict[str, Any]] = {}
+        for code, row in tmp_rows.items():
+            score = self._rank_to_score(int(row.get("best_rank", 9999) or 9999))
+            score += min(int(row.get("appear_days", 0) or 0) * 0.08, 0.2)
+            avg_chg = float(row.get("avg_chg", 0.0) or 0.0)
+            if max_avg_chg > 0 and avg_chg > 0:
+                score += min(avg_chg / max_avg_chg * 0.15, 0.15)
+            stock_kpl_map[code] = {
+                "score": round(min(score, 1.0), 2),
+                **row,
+            }
+
+        today = daily_stats[0] if daily_stats else {}
+        top_today = today.get("top_list", [])[:8]
+        top_today_all = today.get("top_list_all", [])[:12]
+        top_themes_today = today.get("top_themes_all", [])[:12]
+        hottest_theme = top_themes_today[0].get("theme", "") if top_themes_today else ""
+        result.update(
+            {
+                "data_success": True,
+                "daily_kpl_stats": daily_stats,
+                "stock_kpl_map": stock_kpl_map,
+                "theme_heat_map": theme_heat_map,
+                "kpl_summary": {
+                    "days": len(daily_stats),
+                    "tracked_stocks": len(stock_kpl_map),
+                    "tracked_stocks_all": int(today.get("tracked_count_all", 0) or 0),
+                    "requested_stocks": len(target_codes),
+                    "hottest_theme": hottest_theme,
+                    "top_today": top_today,
+                    "top_today_all": top_today_all,
+                    "top_themes_today": top_themes_today,
+                },
+            }
+        )
+        return result
+
+    def _fetch_trade_date_snapshot(self, trade_date: str) -> Optional[pd.DataFrame]:
+        """按交易日拉取整日热榜快照，后续在内存中按股票代码匹配。"""
+        pro = self.data_source_manager.tushare_api
+        candidates = []
+        for tag in ["涨停", "自然涨停", "炸板", "跌停"]:
+            candidates.append({"trade_date": trade_date, "tag": tag})
+        candidates.append({"trade_date": trade_date})
+        for tag in ["涨停", "自然涨停", "炸板", "跌停"]:
+            candidates.append({"date": trade_date, "tag": tag})
+        candidates.append({"date": trade_date})
+        for kwargs in candidates:
+            try:
+                df = call_tushare_with_timeout(
+                    api_callable=lambda: pro.kpl_list(**kwargs),
+                    timeout_sec=60,
+                    api_name="kpl_list",
+                )
+            except TypeError:
+                continue
+            except TimeoutError:
+                continue
+            except Exception:
+                continue
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return None
+
+    def _fetch_range_data(
+        self, start_date: str, end_date: str, query_date: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
+        pro = self.data_source_manager.tushare_api
+        candidates = []
+        if query_date:
+            for tag in ["涨停", "自然涨停", "炸板", "跌停"]:
+                candidates.append({"trade_date": query_date, "tag": tag})
+            for tag in ["涨停", "自然涨停", "炸板", "跌停"]:
+                candidates.append({"date": query_date, "tag": tag})
+        candidates.extend(
+            [
+                {"start_date": start_date, "end_date": end_date},
+                {"start_date": start_date, "end_date": end_date, "tag": "涨停"},
+                {"start_date": start_date, "end_date": end_date, "tag": "自然涨停"},
+                {"start_date": start_date, "end_date": end_date, "tag": "炸板"},
+                {"start_date": start_date, "end_date": end_date, "tag": "跌停"},
+            ]
+        )
+        for kwargs in candidates:
+            if not kwargs:
+                continue
+            try:
+                df = call_tushare_with_timeout(
+                    api_callable=lambda: pro.kpl_list(**kwargs),
+                    timeout_sec=60,
+                    api_name="kpl_list",
+                )
+            except TypeError:
+                continue
+            except TimeoutError:
+                continue
+            except Exception:
+                continue
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return None
+
+    def _fetch_single_day_data(self, trade_date: str, stock_code: str) -> Optional[pd.DataFrame]:
+        pro = self.data_source_manager.tushare_api
+        ts_code = self._to_ts_code(stock_code)
+        candidates = []
+        for tag in ["涨停", "自然涨停", "炸板", "跌停"]:
+            candidates.append({"trade_date": trade_date, "ts_code": ts_code, "tag": tag})
+            candidates.append({"trade_date": trade_date, "ts_code": stock_code, "tag": tag})
+        candidates.extend(
+            [
+                {"trade_date": trade_date, "ts_code": ts_code},
+                {"trade_date": trade_date, "ts_code": stock_code},
+            ]
+        )
+        for kwargs in candidates:
+            try:
+                df = call_tushare_with_timeout(
+                    api_callable=lambda: pro.kpl_list(**kwargs),
+                    timeout_sec=60,
+                    api_name="kpl_list",
+                )
+            except TypeError:
+                continue
+            except TimeoutError:
+                continue
+            except Exception:
+                continue
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return None
+
+    def _normalize_codes(self, codes: List[Any]) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for item in codes:
+            code = self._normalize_code(item)
+            if code and code not in seen:
+                seen.add(code)
+                out.append(code)
+        return out
+
+    def _to_ts_code(self, code: str) -> str:
+        if not code or len(code) != 6 or not code.isdigit():
+            return code
+        if code.startswith("6"):
+            return f"{code}.SH"
+        if code.startswith("0") or code.startswith("3"):
+            return f"{code}.SZ"
+        if code.startswith("8") or code.startswith("4"):
+            return f"{code}.BJ"
+        return f"{code}.SZ"
+
+    def _extract_kpl_records(self, df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
+        if df is None or df.empty:
+            return []
+
+        code_col = self._find_col(df, ["ts_code", "stock_code", "股票代码", "证券代码", "code"])
+        if not code_col:
+            return []
+        name_col = self._find_col(df, ["stock_name", "name", "股票名称", "简称", "gpmc"])
+        rank_col = self._find_col(df, ["rank", "排名", "序号", "no"])
+        theme_col = self._find_col(df, ["theme", "题材", "概念", "板块", "concept"])
+        reason_col = self._find_col(df, ["lu_desc", "reason", "解读", "原因", "逻辑", "备注"])
+        # 涨跌幅字段严格匹配，避免误命中金额类 change_* 列
+        change_col = ""
+        for c in [
+            "pct_chg", "pct_change", "change_pct", "涨跌幅", "涨幅", "pct", "changepercent",
+        ]:
+            if c in df.columns:
+                change_col = c
+                break
+        if not change_col:
+            for col in df.columns:
+                name = str(col).strip().lower()
+                if name in {"pct_chg", "pct_change", "change_pct", "pct", "涨跌幅", "涨幅", "changepercent"}:
+                    change_col = col
+                    break
+        tag_col = self._find_col(df, ["tag", "标签", "类型", "类别"])
+        status_col = self._find_col(df, ["status", "连板", "板", "高度", "梯队"])
+
+        rows: List[Dict[str, Any]] = []
+        for idx, row in df.iterrows():
+            code = self._normalize_code(row.get(code_col))
+            if not code:
+                continue
+            tag_text = self._clean_text(row.get(tag_col)) if tag_col else ""
+            if "竞价" in tag_text:
+                continue
+            name = self._clean_text(row.get(name_col)) if name_col else ""
+            raw_rank = self._safe_number(row.get(rank_col)) if rank_col else 0.0
+            rank = int(round(raw_rank)) if raw_rank > 0 else 0
+            themes = self._split_themes(row.get(theme_col)) if theme_col else []
+            reason = self._clean_text(row.get(reason_col)) if reason_col else ""
+            change_pct = self._safe_number(row.get(change_col)) if change_col else 0.0
+            if change_col and abs(float(change_pct)) < 1e-9:
+                for alt_col in ["pct_chg", "pct_change", "change_pct", "涨跌幅", "涨幅", "pct", "changepercent"]:
+                    if alt_col == change_col or alt_col not in df.columns:
+                        continue
+                    alt_val = self._safe_number(row.get(alt_col))
+                    if abs(float(alt_val)) > 1e-9:
+                        change_pct = alt_val
+                        break
+            # 防御性阈值：超过正常日涨跌幅范围，视为字段误映射，置0
+            if abs(float(change_pct)) > 60:
+                change_pct = 0.0
+            status_text = self._clean_text(row.get(status_col)) if status_col else ""
+            rows.append(
+                {
+                    "code": code,
+                    "name": name,
+                    "rank": int(rank),
+                    "themes": themes,
+                    "themes_text": "、".join(themes[:3]) if themes else "",
+                    "reason": reason[:80] if reason else "",
+                    "change_pct": round(change_pct, 2),
+                    "status": status_text,
+                }
+            )
+
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for item in rows:
+            old = dedup.get(item["code"])
+            if old is None:
+                dedup[item["code"]] = item
+                continue
+            old_rank = int(old.get("rank", 0) or 0)
+            new_rank = int(item.get("rank", 0) or 0)
+            if old_rank > 0 and new_rank > 0:
+                if new_rank < old_rank:
+                    dedup[item["code"]] = item
+                continue
+            if old_rank <= 0 < new_rank:
+                dedup[item["code"]] = item
+                continue
+            if new_rank <= 0:
+                old_chg = float(old.get("change_pct", 0.0) or 0.0)
+                new_chg = float(item.get("change_pct", 0.0) or 0.0)
+                if new_chg > old_chg:
+                    dedup[item["code"]] = item
+
+        out = list(dedup.values())
+        out.sort(
+            key=lambda x: (
+                0 if int(x.get("rank", 0) or 0) > 0 else 1,
+                int(x.get("rank", 0) or 999999),
+                -float(x.get("change_pct", 0.0) or 0.0),
+            )
+        )
+
+        next_rank = 1
+        for item in out:
+            cur = int(item.get("rank", 0) or 0)
+            if cur > 0:
+                if cur >= next_rank:
+                    next_rank = cur + 1
+                continue
+            item["rank"] = next_rank
+            next_rank += 1
+        return out[:120]
+
+    def _rank_to_score(self, rank: int) -> float:
+        if rank <= 10:
+            return 0.7
+        if rank <= 30:
+            return 0.52
+        if rank <= 50:
+            return 0.38
+        if rank <= 100:
+            return 0.24
+        return 0.1
+
+    def _split_themes(self, raw: Any) -> List[str]:
+        text = self._clean_text(raw)
+        if not text:
+            return []
+        parts = re.split(r"[,，;；/|、\s]+", text)
+        noise = {"题材", "概念", "板块", "-", "--", "N/A", "None", "nan"}
+        out: List[str] = []
+        for part in parts:
+            theme = self._clean_text(part)
+            if not theme or theme in noise or theme.isdigit() or len(theme) < 2:
+                continue
+            if self._is_st_theme(theme):
+                continue
+            out.append(theme)
+        dedup: List[str] = []
+        seen = set()
+        for theme in out:
+            if theme not in seen:
+                seen.add(theme)
+                dedup.append(theme)
+        return dedup[:6]
+
+    def _is_st_theme(self, theme: str) -> bool:
+        text = self._clean_text(theme)
+        if not text:
+            return False
+        upper = text.upper()
+        if text == "ST板块" or "风险警示" in text:
+            return True
+        return bool(re.search(r"(^|\b)\*?ST(\b|$)", upper))
+
+    def _build_recent_trade_dates(self, days: int, end_date: Optional[str] = None) -> List[str]:
+        end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        return self.trade_calendar.recent_open_days(end8, max(int(days or 0), 1))
+
+    def _find_col(self, df: pd.DataFrame, keywords: List[str]) -> str:
+        for col in df.columns:
+            name = str(col).lower()
+            if any(k.lower() in name for k in keywords):
+                return col
+        return ""
+
+    def _safe_number(self, value: Any) -> float:
+        if value is None:
+            return 0.0
+        text = str(value).strip().replace(",", "")
+        if not text or text.lower() == "nan":
+            return 0.0
+        m = re.search(r"[-+]?\d*\.?\d+", text)
+        if not m:
+            return 0.0
+        try:
+            return float(m.group())
+        except Exception:
+            return 0.0
+
+    def _clean_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        return "" if text.lower() == "nan" else re.sub(r"\s+", " ", text)
+
+    def _normalize_code(self, value: Any) -> str:
+        text = self._clean_text(value)
+        if not text:
+            return ""
+        if "." in text:
+            base, suffix = text.split(".", 1)
+            suffix = suffix.upper()
+            if suffix not in ("SH", "SZ"):  # 仅A股
+                return ""
+            if len(base) == 6 and base.isdigit() and base[0] in ("0", "3", "6"):
+                return base
+            return ""
+        if len(text) == 6 and text.isdigit() and text[0] in ("0", "3", "6"):
+            return text
+        return ""
+
+    def _parse_date(self, value: str) -> Optional[datetime]:
+        if not value:
+            return None
+        text = str(value).strip()
+        for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(text, fmt)
+            except Exception:
+                continue
+        return None
+
+    def _norm_trade_date(self, value: Any) -> str:
+        text = self._clean_text(value)
+        parsed = self._parse_date(text)
+        if parsed:
+            return parsed.strftime("%Y%m%d")
+        m = re.search(r"(\d{8})", text)
+        return m.group(1) if m else ""
+
+    def _fmt_trade_date(self, trade_date: str) -> str:
+        if not trade_date or len(trade_date) != 8:
+            return trade_date
+        return f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"
+
+
+class LimitCPTHeatFetcher:
+    """基于 Tushare limit_cpt_list 的最强概念板块热度信号"""
+
+    def __init__(self):
+        self.data_source_manager = data_source_manager
+        self.trade_calendar = TradeCalendarService()
+
+    def get_heat_data(self, days: int = 5, end_date: Optional[str] = None) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "data_success": False,
+            "source": "tushare.limit_cpt_list",
+            "query_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "daily_cpt_stats": [],
+            "concept_strength_map": {},
+            "strongest_concepts": [],
+            "market_summary": {},
+        }
+
+        pro = self.data_source_manager.tushare_api
+        if not self.data_source_manager.tushare_available or pro is None:
+            result["error"] = "Tushare不可用或未配置Token"
+            return result
+        if not hasattr(pro, "limit_cpt_list"):
+            result["error"] = "当前Tushare权限或版本不支持 limit_cpt_list"
+            return result
+
+        trading_dates = self._build_recent_trade_dates(days=max(days, 3), end_date=end_date)
+        if not trading_dates:
+            result["error"] = "未生成有效交易日"
+            return result
+
+        all_days: Dict[str, pd.DataFrame] = {}
+        range_df = self._fetch_range_data(
+            trading_dates[-1],
+            trading_dates[0],
+            query_date=trading_dates[0],
+        )
+        if range_df is not None and not range_df.empty:
+            date_col = self._find_col(range_df, ["trade_date", "日期", "date"])
+            if date_col:
+                for trade_date, group in range_df.groupby(date_col):
+                    key = self._norm_trade_date(trade_date)
+                    if key:
+                        all_days[key] = group.copy()
+
+        for trade_date in trading_dates:
+            if trade_date in all_days:
+                continue
+            day_df = self._fetch_single_day_data(trade_date)
+            if day_df is not None and not day_df.empty:
+                all_days[trade_date] = day_df
+
+        daily_cpt_stats: List[Dict[str, Any]] = []
+        concept_raw_scores: Dict[str, float] = defaultdict(float)
+        latest_meta_map: Dict[str, Dict[str, Any]] = {}
+        for day_idx, trade_date in enumerate(trading_dates):
+            day_df = all_days.get(trade_date)
+            records = self._extract_cpt_records(day_df)
+            if not records:
+                continue
+
+            top_concepts = records[:10]
+            daily_cpt_stats.append(
+                {
+                    "trade_date": self._fmt_trade_date(trade_date),
+                    "top_concepts": top_concepts,
+                    "strongest_concept": top_concepts[0]["concept"] if top_concepts else "",
+                    "strongest_count": int(top_concepts[0].get("up_nums", 0) or 0) if top_concepts else 0,
+                }
+            )
+
+            if not latest_meta_map:
+                for item in top_concepts:
+                    concept = str(item.get("concept", "") or "").strip()
+                    if not concept:
+                        continue
+                    latest_meta_map[concept] = {
+                        "rank": int(item.get("rank", 0) or 0),
+                        "up_nums": int(item.get("up_nums", 0) or 0),
+                        "pct_chg": float(item.get("pct_chg", 0.0) or 0.0),
+                    }
+
+            decay = max(0.45, 1.0 - day_idx * 0.15)
+            for rank_idx, item in enumerate(records[:20]):
+                concept = str(item.get("concept", "") or "").strip()
+                if not concept:
+                    continue
+                up_nums = float(item.get("up_nums", 0) or 0.0)
+                pct_chg = float(item.get("pct_chg", 0.0) or 0.0)
+                cons_nums = float(item.get("cons_nums", 0) or 0.0)
+                rank_weight = max(0.45, 2.8 - rank_idx * 0.15)
+                heat_base = 0.8 + min(up_nums / 8.0, 2.0) + min(max(pct_chg, 0.0) / 4.0, 1.5)
+                breadth_bonus = min(cons_nums / 200.0, 0.6)
+                concept_raw_scores[concept] += (heat_base + breadth_bonus) * rank_weight * decay
+
+        if not daily_cpt_stats:
+            result["error"] = "未获取到可用的 limit_cpt_list 数据"
+            return result
+
+        concept_strength_map: Dict[str, float] = {}
+        strongest_concepts: List[Dict[str, Any]] = []
+        if concept_raw_scores:
+            max_raw = max(concept_raw_scores.values()) or 1.0
+            concept_strength_map = {
+                concept: round(min(raw / max_raw * 4.0, 4.0), 2)
+                for concept, raw in sorted(
+                    concept_raw_scores.items(), key=lambda x: x[1], reverse=True
+                )[:50]
+            }
+            for concept, score in list(concept_strength_map.items())[:10]:
+                meta = latest_meta_map.get(concept, {})
+                strongest_concepts.append(
+                    {
+                        "concept": concept,
+                        "score": score,
+                        "rank": int(meta.get("rank", 0) or 0),
+                        "up_nums": int(meta.get("up_nums", 0) or 0),
+                        "pct_chg": round(float(meta.get("pct_chg", 0.0) or 0.0), 2),
+                    }
+                )
+
+        today_top = daily_cpt_stats[0].get("top_concepts", [])[:5] if daily_cpt_stats else []
+        avg_up_nums_today = (
+            round(
+                sum(float(x.get("up_nums", 0) or 0) for x in today_top) / max(len(today_top), 1),
+                2,
+            )
+            if today_top
+            else 0.0
+        )
+        result.update(
+            {
+                "data_success": True,
+                "daily_cpt_stats": daily_cpt_stats,
+                "concept_strength_map": concept_strength_map,
+                "strongest_concepts": strongest_concepts,
+                "market_summary": {
+                    "days": len(daily_cpt_stats),
+                    "strongest_concept": strongest_concepts[0]["concept"] if strongest_concepts else "",
+                    "strongest_score": strongest_concepts[0]["score"] if strongest_concepts else 0.0,
+                    "avg_up_nums_today": avg_up_nums_today,
+                    "top_today": today_top,
+                },
+            }
+        )
+        return result
+
+    def _fetch_range_data(
+        self, start_date: str, end_date: str, query_date: Optional[str] = None
+    ) -> Optional[pd.DataFrame]:
+        pro = self.data_source_manager.tushare_api
+        candidates = [
+            {"trade_date": query_date, "limit": 2000} if query_date else {},
+            {"date": query_date, "limit": 2000} if query_date else {},
+            {"start_date": start_date, "end_date": end_date},
+            {"start_date": start_date, "end_date": end_date, "limit": 2000},
+        ]
+        for kwargs in candidates:
+            if not kwargs:
+                continue
+            try:
+                throttle_tushare_proxy_request("limit_cpt_list")
+                df = pro.limit_cpt_list(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return None
+
+    def _fetch_single_day_data(self, trade_date: str) -> Optional[pd.DataFrame]:
+        pro = self.data_source_manager.tushare_api
+        candidates = [
+            {"trade_date": trade_date, "limit": 2000},
+            {"trade_date": trade_date},
+            {"date": trade_date, "limit": 2000},
+            {"date": trade_date},
+        ]
+        for kwargs in candidates:
+            try:
+                throttle_tushare_proxy_request("limit_cpt_list")
+                df = pro.limit_cpt_list(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                continue
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                return df
+        return None
+
+    def _extract_cpt_records(self, df: Optional[pd.DataFrame]) -> List[Dict[str, Any]]:
+        if df is None or df.empty:
+            return []
+        name_col = self._find_col(df, ["name", "概念", "题材", "板块"])
+        if not name_col:
+            return []
+        code_col = self._find_col(df, ["ts_code", "code", "概念代码"])
+        rank_col = self._find_col(df, ["rank", "排名"])
+        pct_col = self._find_col(df, ["pct_chg", "pct_change", "涨跌幅"])
+        up_col = self._find_col(df, ["up_nums", "up_num", "涨停", "涨停家数"])
+        cons_col = self._find_col(df, ["cons_nums", "成分", "样本"])
+
+        rows: List[Dict[str, Any]] = []
+        for idx, row in df.iterrows():
+            concept = self._clean_text(row.get(name_col))
+            if not concept:
+                continue
+            rank = int(round(self._safe_number(row.get(rank_col)))) if rank_col else int(idx) + 1
+            if rank <= 0:
+                rank = int(idx) + 1
+            pct_chg = self._safe_number(row.get(pct_col)) if pct_col else 0.0
+            up_nums = int(round(self._safe_number(row.get(up_col)))) if up_col else 0
+            cons_nums = int(round(self._safe_number(row.get(cons_col)))) if cons_col else 0
+            ts_code = self._clean_text(row.get(code_col)) if code_col else ""
+            rows.append(
+                {
+                    "concept": concept,
+                    "ts_code": ts_code,
+                    "rank": int(rank),
+                    "pct_chg": round(float(pct_chg), 2),
+                    "up_nums": int(max(up_nums, 0)),
+                    "cons_nums": int(max(cons_nums, 0)),
+                }
+            )
+
+        dedup: Dict[str, Dict[str, Any]] = {}
+        for item in rows:
+            old = dedup.get(item["concept"])
+            if old is None:
+                dedup[item["concept"]] = item
+                continue
+            if item["rank"] < old["rank"]:
+                dedup[item["concept"]] = item
+            elif item["rank"] == old["rank"] and item["up_nums"] > old["up_nums"]:
+                dedup[item["concept"]] = item
+
+        out = list(dedup.values())
+        out.sort(key=lambda x: (x["rank"], -x["up_nums"], -x["pct_chg"]))
+        return out[:100]
+
+    def _build_recent_trade_dates(self, days: int, end_date: Optional[str] = None) -> List[str]:
+        end8 = self._norm_trade_date(end_date) if end_date else datetime.now().strftime("%Y%m%d")
+        return self.trade_calendar.recent_open_days(end8, max(int(days or 0), 1))
+
+    def _find_col(self, df: pd.DataFrame, keywords: List[str]) -> str:
+        for col in df.columns:
+            name = str(col).lower()
+            if any(k.lower() in name for k in keywords):
+                return col
+        return ""
+
+    def _safe_number(self, value: Any) -> float:
+        if value is None:
+            return 0.0
+        text = str(value).strip().replace(",", "")
+        if not text or text.lower() == "nan":
+            return 0.0
+        m = re.search(r"[-+]?\d*\.?\d+", text)
+        if not m:
+            return 0.0
+        try:
+            return float(m.group())
+        except Exception:
+            return 0.0
+
+    def _clean_text(self, value: Any) -> str:
+        if value is None:
+            return ""
+        text = str(value).strip()
+        return "" if text.lower() == "nan" else re.sub(r"\s+", " ", text)
+
+    def _parse_date(self, value: str) -> Optional[datetime]:
+        if not value:
+            return None
+        text = str(value).strip()
+        for fmt in ("%Y%m%d", "%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(text, fmt)
+            except Exception:
+                continue
+        return None
+
+    def _norm_trade_date(self, value: Any) -> str:
+        text = self._clean_text(value)
+        parsed = self._parse_date(text)
+        if parsed:
+            return parsed.strftime("%Y%m%d")
+        m = re.search(r"(\d{8})", text)
+        return m.group(1) if m else ""
+
+    def _fmt_trade_date(self, trade_date: str) -> str:
+        if not trade_date or len(trade_date) != 8:
+            return trade_date
+        return f"{trade_date[:4]}-{trade_date[4:6]}-{trade_date[6:8]}"

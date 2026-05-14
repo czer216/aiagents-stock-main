@@ -1,0 +1,1 @@
+"""Smart monitor prompt builders."""

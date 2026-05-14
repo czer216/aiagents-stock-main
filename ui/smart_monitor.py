@@ -1,0 +1,1 @@
+from modules.smart_monitor.smart_monitor_ui import smart_monitor_ui

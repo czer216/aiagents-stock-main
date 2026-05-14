@@ -9,4 +9,5 @@
 .env
 /.cursor
 /openspec
-TradEnv/
+TradEnv/data/auth.db
+data/longhubang.db
