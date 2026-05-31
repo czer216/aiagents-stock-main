@@ -12,6 +12,8 @@ NAV_FLAGS = [
     "show_theme_peer",
     "show_kline_similarity",
     "show_bottom_volume_arbitrage",
+    "show_strong_pullback_restart",
+    "show_bottom_volume_surge",
     "show_smart_monitor",
     "show_user_admin",
     "show_douban_author_strategy",

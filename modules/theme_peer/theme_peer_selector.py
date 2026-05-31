@@ -14,15 +14,20 @@ import re
 import json
 import math
 import os
+import logging
 import db_adapter as sqlite3
+import requests
 
 import pandas as pd
+import config
 
 from services.data_source_manager import data_source_manager
+from services.trade_calendar_service import TradeCalendarService
 from infrastructure.external.tushare_proxy_rate_limit import call_tushare_with_timeout
 from modules.longhubang.longhubang_kline_signals import SevenDayKlineTrendFetcher
 from modules.longhubang.longhubang_hot_signals import KPLListHeatFetcher
 from modules.longhubang.longhubang_history import LonghubangHistoryService
+from modules.smart_monitor.smart_monitor_tdx_data import SmartMonitorTDXDataFetcher
 
 
 @dataclass
@@ -49,6 +54,8 @@ class PeerCandidate:
 class ThemePeerSelector:
     """同题材低位补涨推荐"""
 
+    logger = logging.getLogger(__name__)
+
     KPL_TAGS = [
         "涨停",
         "连板",
@@ -69,7 +76,9 @@ class ThemePeerSelector:
         self.pro = data_source_manager.tushare_api if data_source_manager.tushare_available else None
         self._stock_basic_cache: Optional[pd.DataFrame] = None
         self._ai_client = None
+        self._tdx_fetcher = SmartMonitorTDXDataFetcher(base_url=str(config.TDX_CONFIG.get('base_url') or '').strip())
         self._trend_fetcher = SevenDayKlineTrendFetcher()
+        self.trade_calendar = TradeCalendarService()
         self.history_service = LonghubangHistoryService()
         self._last_cache_error = ""
         self.kline_db_path = self._resolve_kline_db_path()
@@ -761,13 +770,21 @@ class ThemePeerSelector:
 
         start8 = start_dt.strftime("%Y%m%d")
         end8 = end_dt.strftime("%Y%m%d")
+        cache_latest = self._get_cache_latest_trade_date()
+        meta["cache_latest_trade_date"] = cache_latest
 
         if not full_refresh:
             last_sync = self._get_sync_meta("mainboard_last_sync_date")
+            sync_anchor = ""
+            if last_sync and re.fullmatch(r"\d{8}", last_sync):
+                sync_anchor = last_sync
+            if cache_latest and re.fullmatch(r"\d{8}", cache_latest):
+                if (not sync_anchor) or cache_latest < sync_anchor:
+                    sync_anchor = cache_latest
             has_missing_adj = self._has_any_missing_adj_factor(start8, end8)
-            if (not has_missing_adj) and last_sync and re.fullmatch(r"\d{8}", last_sync):
+            if (not has_missing_adj) and sync_anchor:
                 try:
-                    next_dt = datetime.strptime(last_sync, "%Y%m%d") + timedelta(days=1)
+                    next_dt = datetime.strptime(sync_anchor, "%Y%m%d") + timedelta(days=1)
                     start8 = max(start8, next_dt.strftime("%Y%m%d"))
                 except Exception:
                     pass
@@ -792,9 +809,10 @@ class ThemePeerSelector:
             return meta
 
         synced_symbols: set = set()
+        baseline_symbol_count = int(tracked_symbols) if int(tracked_symbols) > 0 else 200
         for trade_date in trade_dates:
-            already = self._is_trade_date_cached(trade_date, min_rows=max(50, len(symbol_set) // 4))
-            need_refill_adj = self._trade_date_missing_adj_factor(trade_date, min_missing_rows=max(20, len(symbol_set) // 10))
+            already = self._is_trade_date_cached(trade_date, min_rows=max(50, baseline_symbol_count // 4))
+            need_refill_adj = self._trade_date_missing_adj_factor(trade_date, min_missing_rows=max(20, baseline_symbol_count // 10))
             if already and not full_refresh and not need_refill_adj:
                 meta["skipped_trade_dates"] += 1
                 continue
@@ -897,6 +915,176 @@ class ThemePeerSelector:
         out = out.dropna(subset=["日期", "收盘"]).reset_index(drop=True)
         return out
 
+    def _fetch_realtime_quotes_batch(self, symbols: List[str], timeout_sec: float = 1.8) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        codes = [self._normalize_symbol(x) for x in (symbols or [])]
+        codes = [x for x in codes if re.fullmatch(r"\d{6}", str(x or ""))]
+        if not codes:
+            return out
+
+        base_url = str(config.TDX_CONFIG.get("base_url") or "").strip().rstrip("/")
+        if not base_url:
+            return out
+
+        uniq_codes = list(dict.fromkeys(codes))
+        batch_size = 50
+        for i in range(0, len(uniq_codes), batch_size):
+            batch_codes = uniq_codes[i : i + batch_size]
+            try:
+                resp = requests.get(
+                    f"{base_url}/api/quote",
+                    params={"code": ",".join(batch_codes)},
+                    timeout=float(timeout_sec),
+                )
+                payload = resp.json() if resp is not None else {}
+                if (payload or {}).get("code") != 0:
+                    continue
+                rows = payload.get("data") or []
+                if not isinstance(rows, list):
+                    continue
+                for item in rows:
+                    if not isinstance(item, dict):
+                        continue
+                    code = self._normalize_symbol(str(item.get("Code") or ""))
+                    if not code:
+                        continue
+                    k = item.get("K") or {}
+                    price = float(k.get("Close") or 0) / 1000
+                    pre_close = float(k.get("Last") or 0) / 1000
+                    open_price = float(k.get("Open") or 0) / 1000
+                    high_price = float(k.get("High") or 0) / 1000
+                    low_price = float(k.get("Low") or 0) / 1000
+                    volume = float(item.get("TotalHand") or 0)
+                    amount = float(item.get("Amount") or 0) / 1000
+                    update_time = ""
+                    server_time_raw = item.get("ServerTime", 0)
+                    try:
+                        ts_val = int(float(server_time_raw or 0))
+                        if ts_val > 10**12:
+                            ts_val = ts_val // 1000
+                        if ts_val > 0:
+                            dt_val = datetime.fromtimestamp(ts_val)
+                            if dt_val.year >= 2000:
+                                update_time = dt_val.strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        update_time = ""
+                    out[code] = {
+                        "current_price": price,
+                        "pre_close": pre_close,
+                        "open": open_price,
+                        "high": high_price,
+                        "low": low_price,
+                        "volume": volume,
+                        "amount": amount,
+                        "update_time": update_time,
+                    }
+            except Exception:
+                continue
+        return out
+
+    def _build_realtime_today_bar(
+        self,
+        df: pd.DataFrame,
+        symbol: str,
+        end8: str,
+        enable_realtime: bool = True,
+        realtime_quote: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        meta: Dict[str, Any] = {"realtime_used": False}
+        if df is None or df.empty or not re.fullmatch(r"\d{8}", str(end8 or "")):
+            return df, meta
+
+        work = df.copy().reset_index(drop=True)
+        date_col = "日期" if "日期" in work.columns else ("trade_date" if "trade_date" in work.columns else "")
+        if not date_col:
+            return df, meta
+        if date_col == "trade_date":
+            work[date_col] = pd.to_datetime(work[date_col], format="%Y%m%d", errors="coerce")
+        else:
+            work[date_col] = pd.to_datetime(work[date_col], errors="coerce")
+
+        today_dt = pd.to_datetime(end8, format="%Y%m%d", errors="coerce")
+        if pd.isna(today_dt):
+            return df, meta
+
+        today_mask = work[date_col].dt.strftime("%Y%m%d") == end8
+        if bool(today_mask.any()):
+            return df, meta
+        if not bool(enable_realtime):
+            return df, meta
+
+        rt = dict(realtime_quote or {}) if isinstance(realtime_quote, dict) else {}
+        if not rt:
+            try:
+                current_base = str(config.TDX_CONFIG.get('base_url') or '').strip().rstrip('/')
+                if current_base:
+                    self._tdx_fetcher.base_url = current_base
+                self._tdx_fetcher.timeout = 1.2
+                rt = self._tdx_fetcher.get_realtime_quote(symbol, include_name=False) or {}
+            except Exception:
+                rt = {}
+        if not rt:
+            return df, meta
+
+        try:
+            price = float(rt.get("current_price") or 0)
+            pre_close = float(rt.get("pre_close") or 0)
+            if price <= 0 or pre_close <= 0:
+                return df, meta
+            open_price = float(rt.get("open") or price)
+            high_price = float(rt.get("high") or price)
+            low_price = float(rt.get("low") or price)
+            volume = float(rt.get("volume") or 0)
+            amount = float(rt.get("amount") or 0)
+            change_pct = ((price - pre_close) / pre_close * 100.0) if pre_close > 0 else 0.0
+        except Exception:
+            return df, meta
+
+        if date_col == "trade_date":
+            today_row = pd.DataFrame(
+                {
+                    "trade_date": [end8],
+                    "open": [open_price],
+                    "high": [max(high_price, price, open_price)],
+                    "low": [min(low_price, price, open_price)],
+                    "close": [price],
+                    "vol": [volume],
+                    "amount": [amount],
+                    "adj_factor": [work["adj_factor"].dropna().iloc[-1] if "adj_factor" in work.columns and not work["adj_factor"].dropna().empty else None],
+                }
+            )
+            work = pd.concat([work, today_row], ignore_index=True)
+            work = work.sort_values("trade_date").reset_index(drop=True)
+        else:
+            today_row = pd.DataFrame(
+                {
+                    "日期": [today_dt],
+                    "开盘": [open_price],
+                    "最高": [max(high_price, price, open_price)],
+                    "最低": [min(low_price, price, open_price)],
+                    "收盘": [price],
+                    "成交量": [volume],
+                    "成交额": [amount],
+                }
+            )
+            if "成交额" not in work.columns:
+                work["成交额"] = 0.0
+            work = pd.concat([work, today_row], ignore_index=True)
+            work = work.sort_values("日期").reset_index(drop=True)
+
+        meta.update(
+            {
+                "realtime_used": True,
+                "realtime_update_time": str(rt.get("update_time") or ""),
+                "realtime_price": price,
+                "realtime_pre_close": pre_close,
+                "realtime_change_pct": change_pct,
+                "realtime_amount": amount,
+                "realtime_volume": volume,
+            }
+        )
+        return work, meta
+
     def _build_adjusted_ohlc(self, df: pd.DataFrame) -> Tuple[pd.DataFrame, bool]:
         cols = ["open", "high", "low", "close"]
         out = df.copy()
@@ -955,6 +1143,9 @@ class ThemePeerSelector:
         if df is None or df.empty:
             return pd.DataFrame()
 
+        if end8:
+            df, _ = self._build_realtime_today_bar(df, symbol, end8)
+
         adjusted_df, used_adjustment = self._build_adjusted_ohlc(df)
         out = pd.DataFrame(
             {
@@ -1000,6 +1191,7 @@ class ThemePeerSelector:
                 "best_vol_ratio": float(best_vol_ratio),
                 "hotspot_weight": float(hotspot_weight),
                 "bottom_lookback_days": int(bottom_lookback_days),
+                "realtime_patch_max_symbols": 0,
             },
         }
 
@@ -1010,8 +1202,8 @@ class ThemePeerSelector:
         out["end_date"] = end_dt.strftime("%Y-%m-%d")
 
         end8 = end_dt.strftime("%Y%m%d")
-        last_sync = self._get_sync_meta("mainboard_last_sync_date")
-        need_sync = (not last_sync) or (last_sync < end8)
+        cache_latest_before = self._get_cache_latest_trade_date()
+        need_sync = (not cache_latest_before) or (cache_latest_before < end8)
         if need_sync:
             sync_meta = self.sync_mainboard_kline_cache(
                 start_date="2026-01-01",
@@ -1023,7 +1215,7 @@ class ThemePeerSelector:
                 "success": True,
                 "mode": "skip_up_to_date",
                 "db_path": self.kline_db_path,
-                "last_sync": last_sync,
+                "last_sync": self._get_sync_meta("mainboard_last_sync_date"),
                 "requested_trade_dates": 0,
                 "skipped_trade_dates": 0,
                 "written_rows": 0,
@@ -1038,6 +1230,7 @@ class ThemePeerSelector:
         if not latest_trade_date:
             out["error"] = "K线缓存为空，请先同步"
             return out
+        out["params"]["realtime_fallback_today"] = bool(str(latest_trade_date) < str(end8))
 
         stock_map = self._get_stock_name_map()
         universe = self._build_mainboard_universe(limit=max_candidates)
@@ -1049,11 +1242,28 @@ class ThemePeerSelector:
         bottom_lookback_days = max(10, min(int(bottom_lookback_days or 60), 250))
 
         rows: List[Dict[str, Any]] = []
-        for symbol in universe:
+        realtime_patch_max_symbols = int(out["params"].get("realtime_patch_max_symbols") or 120)
+        use_realtime_fallback = bool(str(latest_trade_date) < str(end8))
+        realtime_quote_map: Dict[str, Dict[str, Any]] = {}
+        if use_realtime_fallback:
+            if realtime_patch_max_symbols <= 0:
+                rt_symbols = list(universe)
+            else:
+                rt_symbols = list(universe[:realtime_patch_max_symbols])
+            realtime_quote_map = self._fetch_realtime_quotes_batch(rt_symbols, timeout_sec=1.8)
+        for idx, symbol in enumerate(universe):
             out["scanned"] += 1
             df = self._load_latest_window_from_cache(symbol=symbol, bars=20, end_trade_date=latest_trade_date)
             if df is None or df.empty or len(df.index) < 8:
                 continue
+            enable_rt = use_realtime_fallback and ((realtime_patch_max_symbols <= 0) or (idx < realtime_patch_max_symbols))
+            df, realtime_meta = self._build_realtime_today_bar(
+                df,
+                symbol,
+                end8,
+                enable_realtime=enable_rt,
+                realtime_quote=realtime_quote_map.get(symbol),
+            )
             signal = self._detect_bottom_volume_arbitrage(
                 df,
                 breakout_min_vol_multiple=float(breakout_min_vol_multiple),
@@ -1083,6 +1293,11 @@ class ThemePeerSelector:
                     "hot_theme_max_score": 0.0,
                     "hot_theme_boost": 0.0,
                     "final_score": round(float(signal.get("score", 0.0) or 0.0), 4),
+                    "realtime_used": bool(realtime_meta.get("realtime_used", False)),
+                    "realtime_update_time": str(realtime_meta.get("realtime_update_time", "") or ""),
+                    "realtime_amount": round(float(realtime_meta.get("realtime_amount", 0.0) or 0.0), 2),
+                    "realtime_volume": round(float(realtime_meta.get("realtime_volume", 0.0) or 0.0), 0),
+                    "realtime_change_pct": round(float(realtime_meta.get("realtime_change_pct", 0.0) or 0.0), 2),
                 }
             )
 
@@ -1153,6 +1368,593 @@ class ThemePeerSelector:
         if not top_rows:
             out["error"] = "未找到满足底部放量套利规则的标的"
         return out
+
+    def recommend_bottom_volume_surge(
+        self,
+        end_date: Optional[str] = None,
+        top_n: int = 20,
+        max_candidates: Optional[int] = None,
+        surge_min_vol_multiple: float = 2.0,
+        surge_min_body_pct: float = 4.0,
+        bottom_lookback_days: int = 60,
+        recent_days_window: int = 1,
+        hotspot_weight: float = 0.8,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "success": False,
+            "end_date": "",
+            "latest_trade_date": "",
+            "candidate_universe": 0,
+            "scanned": 0,
+            "valid": 0,
+            "candidates": [],
+            "error": "",
+            "price_adjustment_mode": "qfq_window_normalized",
+            "params": {
+                "surge_min_vol_multiple": float(surge_min_vol_multiple),
+                "surge_min_body_pct": float(surge_min_body_pct),
+                "bottom_lookback_days": int(bottom_lookback_days),
+                "recent_days_window": int(recent_days_window),
+                "hotspot_weight": float(hotspot_weight),
+                "realtime_patch_max_symbols": 0,
+            },
+        }
+
+        end_dt = self._parse_date_flexible(end_date or datetime.now().strftime("%Y-%m-%d"))
+        if end_dt is None:
+            out["error"] = "结束日期无效"
+            return out
+        out["end_date"] = end_dt.strftime("%Y-%m-%d")
+        end8 = end_dt.strftime("%Y%m%d")
+
+        sync_meta = self.sync_mainboard_kline_cache(
+            start_date="2026-01-01",
+            end_date=out["end_date"],
+            full_refresh=False,
+        )
+        out["kline_cache_sync"] = sync_meta
+
+        latest_trade_date = self._get_cache_latest_trade_date()
+        out["latest_trade_date"] = latest_trade_date
+        if not latest_trade_date:
+            out["error"] = "K线缓存为空，请先同步"
+            return out
+        out["params"]["realtime_fallback_today"] = bool(str(latest_trade_date) < str(end8))
+
+        bottom_lookback_days = max(20, min(int(bottom_lookback_days or 60), 180))
+        recent_days_window = int(recent_days_window or 1)
+        if recent_days_window not in (1, 3, 5):
+            recent_days_window = 1
+
+        allowed_trade_dates: List[str] = []
+        recent_start_trade_date = end8
+        recent_end_trade_date = end8
+        try:
+            allowed_trade_dates = sorted(self.trade_calendar.recent_open_days(end8, recent_days_window))
+        except Exception:
+            try:
+                with sqlite3.connect(self.kline_db_path, timeout=15) as conn:
+                    conn.execute("PRAGMA query_only=ON")
+                    window_df = pd.read_sql_query(
+                        """
+                        SELECT DISTINCT trade_date
+                        FROM kline_daily
+                        WHERE trade_date <= ?
+                        ORDER BY trade_date DESC
+                        LIMIT ?
+                        """,
+                        conn,
+                        params=(end8, int(recent_days_window)),
+                    )
+                if window_df is not None and not window_df.empty:
+                    vals = [str(v).strip() for v in window_df["trade_date"].tolist() if str(v).strip()]
+                    allowed_trade_dates = sorted(set(vals))
+            except Exception:
+                allowed_trade_dates = []
+
+        if not allowed_trade_dates:
+            allowed_trade_dates = [end8]
+        recent_start_trade_date = allowed_trade_dates[0]
+        recent_end_trade_date = allowed_trade_dates[-1]
+
+        out["params"]["recent_start_trade_date"] = str(recent_start_trade_date)
+        out["params"]["recent_end_trade_date"] = str(recent_end_trade_date)
+        out["params"]["allowed_trade_dates"] = list(allowed_trade_dates)
+
+        stock_map = self._get_stock_name_map()
+        universe = self._build_mainboard_universe(limit=max_candidates)
+        out["candidate_universe"] = len(universe)
+        if not universe:
+            out["error"] = "主板候选池为空"
+            return out
+
+        rows: List[Dict[str, Any]] = []
+        realtime_patch_max_symbols = int(out["params"].get("realtime_patch_max_symbols") or 120)
+        use_realtime_fallback = bool(str(latest_trade_date) < str(end8))
+        realtime_quote_map: Dict[str, Dict[str, Any]] = {}
+        if use_realtime_fallback:
+            if realtime_patch_max_symbols <= 0:
+                rt_symbols = list(universe)
+            else:
+                rt_symbols = list(universe[:realtime_patch_max_symbols])
+            realtime_quote_map = self._fetch_realtime_quotes_batch(rt_symbols, timeout_sec=1.8)
+        for idx, symbol in enumerate(universe):
+            out["scanned"] += 1
+            bars = max(25, int(bottom_lookback_days) + 10)
+            df = self._load_latest_window_from_cache(symbol=symbol, bars=bars, end_trade_date=end8)
+            if df is None or df.empty or len(df.index) < 8:
+                continue
+            enable_rt = use_realtime_fallback and ((realtime_patch_max_symbols <= 0) or (idx < realtime_patch_max_symbols))
+            df, realtime_meta = self._build_realtime_today_bar(
+                df,
+                symbol,
+                end8,
+                enable_realtime=enable_rt,
+                realtime_quote=realtime_quote_map.get(symbol),
+            )
+            signal = self._detect_bottom_volume_surge(
+                df=df,
+                surge_min_vol_multiple=float(surge_min_vol_multiple),
+                surge_min_body_pct=float(surge_min_body_pct),
+                bottom_lookback_days=int(bottom_lookback_days),
+                recent_days_window=int(recent_days_window),
+                allowed_trade_dates=list(allowed_trade_dates),
+            )
+            if not signal.get("hit"):
+                continue
+            out["valid"] += 1
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": stock_map.get(symbol, ""),
+                    "signal_score": round(float(signal.get("score", 0.0) or 0.0), 4),
+                    "surge_date": str(signal.get("surge_date", "") or ""),
+                    "surge_vol_multiple": round(float(signal.get("surge_vol_multiple", 0.0) or 0.0), 3),
+                    "surge_body_pct": round(float(signal.get("surge_body_pct", 0.0) or 0.0), 2),
+                    "bottom_pos": round(float(signal.get("bottom_pos", 0.0) or 0.0), 4),
+                    "latest_close": round(float(signal.get("latest_close", 0.0) or 0.0), 2),
+                    "reason": str(signal.get("reason", "") or ""),
+                    "hot_themes": [],
+                    "hot_theme_max_score": 0.0,
+                    "hot_theme_boost": 0.0,
+                    "final_score": round(float(signal.get("score", 0.0) or 0.0), 4),
+                    "realtime_used": bool(realtime_meta.get("realtime_used", False)),
+                    "realtime_update_time": str(realtime_meta.get("realtime_update_time", "") or ""),
+                    "realtime_amount": round(float(realtime_meta.get("realtime_amount", 0.0) or 0.0), 2),
+                    "realtime_volume": round(float(realtime_meta.get("realtime_volume", 0.0) or 0.0), 0),
+                    "realtime_change_pct": round(float(realtime_meta.get("realtime_change_pct", 0.0) or 0.0), 2),
+                }
+            )
+
+        if allowed_trade_dates:
+            allowed_dates_fmt = {
+                f"{d[:4]}-{d[4:6]}-{d[6:8]}"
+                for d in allowed_trade_dates
+                if isinstance(d, str) and len(d) == 8 and d.isdigit()
+            }
+            rows = [r for r in rows if str(r.get("surge_date") or "") in allowed_dates_fmt]
+
+        if rows and float(hotspot_weight) > 0:
+            sample_n = max(30, min(len(rows), max(50, int(top_n or 20) * 3)))
+            symbols_for_hot = [str(r.get("symbol") or "") for r in rows[:sample_n] if str(r.get("symbol") or "")]
+            if symbols_for_hot:
+                try:
+                    heat_fetcher = KPLListHeatFetcher()
+                    heat_data = heat_fetcher.get_heat_data(days=3, end_date=end8, stock_codes=symbols_for_hot, exact_trade_date_only=False)
+                    theme_heat_map = (heat_data or {}).get("theme_heat_map", {}) or {}
+                    stock_kpl_map = (heat_data or {}).get("stock_kpl_map", {}) or {}
+                    for r in rows:
+                        code = str(r.get("symbol") or "")
+                        if not code:
+                            continue
+                        kpl_item = stock_kpl_map.get(code) or {}
+                        themes = list(kpl_item.get("themes", []) or [])
+                        theme_scores = [float(theme_heat_map.get(t, 0.0) or 0.0) for t in themes]
+                        hot_max = max(theme_scores) if theme_scores else 0.0
+                        boost = min(max(hot_max / 4.0, 0.0), 1.0) * float(hotspot_weight)
+                        r["hot_themes"] = themes[:5]
+                        r["hot_theme_max_score"] = round(hot_max, 4)
+                        r["hot_theme_boost"] = round(boost, 4)
+                        r["final_score"] = round(float(r.get("signal_score", 0.0) or 0.0) + boost, 4)
+                except Exception:
+                    pass
+
+        rows.sort(
+            key=lambda x: (
+                float(x.get("final_score", x.get("signal_score", 0.0)) or 0.0),
+                float(x.get("surge_vol_multiple", 0.0) or 0.0),
+                float(x.get("surge_body_pct", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        top_rows = rows[:max(1, int(top_n or 20))]
+        for i, r in enumerate(top_rows, 1):
+            r["rank"] = i
+
+        out["success"] = True
+        out["candidates"] = top_rows
+        if not top_rows:
+            out["error"] = "未找到满足突然底部放量规则的标的"
+        return out
+
+    def _detect_bottom_volume_surge(
+        self,
+        df: pd.DataFrame,
+        surge_min_vol_multiple: float,
+        surge_min_body_pct: float,
+        bottom_lookback_days: int,
+        recent_days_window: int,
+        allowed_trade_dates: List[str],
+    ) -> Dict[str, Any]:
+        if df is None or df.empty or len(df.index) < 8:
+            return {"hit": False, "reason": "bars_not_enough"}
+
+        work = df.copy().reset_index(drop=True)
+        close = pd.to_numeric(work.get("收盘"), errors="coerce")
+        open_ = pd.to_numeric(work.get("开盘"), errors="coerce")
+        low = pd.to_numeric(work.get("最低"), errors="coerce")
+        vol = pd.to_numeric(work.get("成交量"), errors="coerce")
+        dates = pd.to_datetime(work.get("日期"), errors="coerce")
+
+        n = len(work.index)
+        recent_days_window = int(recent_days_window or 1)
+        if recent_days_window not in (1, 3, 5):
+            recent_days_window = 1
+        start_i = max(5, n - recent_days_window)
+
+        best_signal: Dict[str, Any] = {"hit": False, "reason": "no_recent_surge"}
+        best_score = -1e9
+        allowed_set = {str(x).strip() for x in (allowed_trade_dates or []) if str(x).strip()}
+        for i in range(start_i, n):
+            dt8 = ""
+            if i < len(dates) and pd.notna(dates.iloc[i]):
+                dt8 = pd.to_datetime(dates.iloc[i]).strftime("%Y%m%d")
+            if allowed_set and dt8 not in allowed_set:
+                continue
+            o = float(open_.iloc[i]) if pd.notna(open_.iloc[i]) else 0.0
+            c = float(close.iloc[i]) if pd.notna(close.iloc[i]) else 0.0
+            v = float(vol.iloc[i]) if pd.notna(vol.iloc[i]) else 0.0
+            prev_close = float(close.iloc[i - 1]) if i > 0 and pd.notna(close.iloc[i - 1]) else 0.0
+            if o <= 0 or c <= 0 or v <= 0 or prev_close <= 0:
+                continue
+            if c <= o:
+                continue
+
+            surge_body_pct = (c - prev_close) / prev_close * 100.0
+            prev = vol.iloc[max(0, i - 5):i]
+            prev_avg = float(pd.to_numeric(prev, errors="coerce").dropna().mean()) if len(prev) else 0.0
+            if prev_avg <= 0:
+                continue
+            surge_vol_multiple = v / prev_avg
+
+            if surge_body_pct < float(surge_min_body_pct) or surge_vol_multiple < float(surge_min_vol_multiple):
+                continue
+
+            low_ref = pd.to_numeric(low.iloc[max(0, i - int(bottom_lookback_days)):i + 1], errors="coerce").dropna()
+            if low_ref.empty:
+                continue
+            bottom_pos = (c - float(low_ref.min())) / max(c, 1e-9)
+            if bottom_pos > 0.20:
+                continue
+
+            score = 1.0
+            score += min(2.0, max(0.0, surge_vol_multiple - float(surge_min_vol_multiple)))
+            score += min(1.5, max(0.0, (surge_body_pct - float(surge_min_body_pct)) / 4.0))
+            score += min(1.0, max(0.0, (0.20 - bottom_pos) * 5.0))
+            recency_bonus = max(0.0, float(i - start_i) / max(1.0, float(n - start_i))) * 0.3
+            score += recency_bonus
+
+            surge_date = pd.to_datetime(dates.iloc[i]).strftime("%Y-%m-%d") if pd.notna(dates.iloc[i]) else ""
+            candidate = {
+                "hit": True,
+                "reason": f"底部位{bottom_pos:.2f}, 放量{surge_vol_multiple:.2f}x, 涨幅{surge_body_pct:.2f}% (近{recent_days_window}天)",
+                "score": score,
+                "surge_date": surge_date,
+                "surge_vol_multiple": surge_vol_multiple,
+                "surge_body_pct": surge_body_pct,
+                "bottom_pos": bottom_pos,
+                "latest_close": float(c),
+            }
+            if score > best_score:
+                best_score = score
+                best_signal = candidate
+
+        return best_signal
+
+    def recommend_strong_pullback_restart(
+        self,
+        end_date: Optional[str] = None,
+        top_n: int = 20,
+        max_candidates: Optional[int] = None,
+        strong_lookback_days: int = 60,
+        strong_min_gain_pct: float = 15.0,
+        pullback_max_retrace: float = 0.5,
+        pullback_max_vol_ratio: float = 0.7,
+        restart_min_gain_pct: float = 2.0,
+        restart_min_vol_ratio: float = 1.2,
+        hotspot_weight: float = 0.8,
+    ) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "success": False,
+            "end_date": "",
+            "latest_trade_date": "",
+            "candidate_universe": 0,
+            "scanned": 0,
+            "valid": 0,
+            "candidates": [],
+            "error": "",
+            "price_adjustment_mode": "qfq_window_normalized",
+            "params": {
+                "strong_lookback_days": int(strong_lookback_days),
+                "strong_min_gain_pct": float(strong_min_gain_pct),
+                "pullback_max_retrace": float(pullback_max_retrace),
+                "pullback_max_vol_ratio": float(pullback_max_vol_ratio),
+                "restart_min_gain_pct": float(restart_min_gain_pct),
+                "restart_min_vol_ratio": float(restart_min_vol_ratio),
+                "hotspot_weight": float(hotspot_weight),
+            },
+        }
+
+        end_dt = self._parse_date_flexible(end_date or datetime.now().strftime("%Y-%m-%d"))
+        if end_dt is None:
+            out["error"] = "结束日期无效"
+            return out
+        out["end_date"] = end_dt.strftime("%Y-%m-%d")
+        end8 = end_dt.strftime("%Y%m%d")
+
+        last_sync = self._get_sync_meta("mainboard_last_sync_date")
+        need_sync = (not last_sync) or (last_sync < end8)
+        if need_sync:
+            sync_meta = self.sync_mainboard_kline_cache(
+                start_date="2026-01-01",
+                end_date=out["end_date"],
+                full_refresh=False,
+            )
+        else:
+            sync_meta = {
+                "success": True,
+                "mode": "skip_up_to_date",
+                "db_path": self.kline_db_path,
+                "last_sync": last_sync,
+                "requested_trade_dates": 0,
+                "skipped_trade_dates": 0,
+                "written_rows": 0,
+                "synced_symbols": 0,
+                "error_symbols": 0,
+                "symbols": 0,
+            }
+        out["kline_cache_sync"] = sync_meta
+
+        latest_trade_date = self._get_cache_latest_trade_date()
+        out["latest_trade_date"] = latest_trade_date
+        if not latest_trade_date:
+            out["error"] = "K线缓存为空，请先同步"
+            return out
+
+        strong_lookback_days = max(20, min(int(strong_lookback_days or 60), 180))
+        stock_map = self._get_stock_name_map()
+        universe = self._build_mainboard_universe(limit=max_candidates)
+        out["candidate_universe"] = len(universe)
+        if not universe:
+            out["error"] = "主板候选池为空"
+            return out
+
+        rows: List[Dict[str, Any]] = []
+        for symbol in universe:
+            out["scanned"] += 1
+            bars = max(35, int(strong_lookback_days) + 20)
+            df = self._load_latest_window_from_cache(symbol=symbol, bars=bars, end_trade_date=latest_trade_date)
+            if df is None or df.empty or len(df.index) < 12:
+                continue
+            signal = self._detect_strong_pullback_restart(
+                df=df,
+                strong_lookback_days=int(strong_lookback_days),
+                strong_min_gain_pct=float(strong_min_gain_pct),
+                pullback_max_retrace=float(pullback_max_retrace),
+                pullback_max_vol_ratio=float(pullback_max_vol_ratio),
+                restart_min_gain_pct=float(restart_min_gain_pct),
+                restart_min_vol_ratio=float(restart_min_vol_ratio),
+            )
+            if not signal.get("hit"):
+                continue
+            out["valid"] += 1
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "name": stock_map.get(symbol, ""),
+                    "signal_score": round(float(signal.get("score", 0.0) or 0.0), 4),
+                    "strong_start_date": str(signal.get("strong_start_date", "") or ""),
+                    "strong_end_date": str(signal.get("strong_end_date", "") or ""),
+                    "strong_gain_pct": round(float(signal.get("strong_gain_pct", 0.0) or 0.0), 2),
+                    "pullback_retrace_ratio": round(float(signal.get("pullback_retrace_ratio", 0.0) or 0.0), 4),
+                    "pullback_vol_ratio": round(float(signal.get("pullback_vol_ratio", 0.0) or 0.0), 4),
+                    "restart_date": str(signal.get("restart_date", "") or ""),
+                    "restart_gain_pct": round(float(signal.get("restart_gain_pct", 0.0) or 0.0), 2),
+                    "restart_vol_ratio": round(float(signal.get("restart_vol_ratio", 0.0) or 0.0), 4),
+                    "latest_close": round(float(signal.get("latest_close", 0.0) or 0.0), 2),
+                    "reason": str(signal.get("reason", "") or ""),
+                    "hot_themes": [],
+                    "hot_theme_max_score": 0.0,
+                    "hot_theme_boost": 0.0,
+                    "final_score": round(float(signal.get("score", 0.0) or 0.0), 4),
+                    "realtime_used": bool(realtime_meta.get("realtime_used", False)),
+                    "realtime_update_time": str(realtime_meta.get("realtime_update_time", "") or ""),
+                    "realtime_amount": round(float(realtime_meta.get("realtime_amount", 0.0) or 0.0), 2),
+                    "realtime_volume": round(float(realtime_meta.get("realtime_volume", 0.0) or 0.0), 0),
+                    "realtime_change_pct": round(float(realtime_meta.get("realtime_change_pct", 0.0) or 0.0), 2),
+                }
+            )
+
+        if rows and float(hotspot_weight) > 0:
+            sample_n = max(30, min(len(rows), max(50, int(top_n or 20) * 3)))
+            symbols_for_hot = [str(r.get("symbol") or "") for r in rows[:sample_n] if str(r.get("symbol") or "")]
+            if symbols_for_hot:
+                try:
+                    heat_fetcher = KPLListHeatFetcher()
+                    heat_data = heat_fetcher.get_heat_data(days=3, end_date=end8, stock_codes=symbols_for_hot, exact_trade_date_only=False)
+                    theme_heat_map = (heat_data or {}).get("theme_heat_map", {}) or {}
+                    stock_kpl_map = (heat_data or {}).get("stock_kpl_map", {}) or {}
+                    for r in rows:
+                        code = str(r.get("symbol") or "")
+                        if not code:
+                            continue
+                        kpl_item = stock_kpl_map.get(code) or {}
+                        themes = list(kpl_item.get("themes", []) or [])
+                        theme_scores = [float(theme_heat_map.get(t, 0.0) or 0.0) for t in themes]
+                        hot_max = max(theme_scores) if theme_scores else 0.0
+                        boost = min(max(hot_max / 4.0, 0.0), 1.0) * float(hotspot_weight)
+                        r["hot_themes"] = themes[:5]
+                        r["hot_theme_max_score"] = round(hot_max, 4)
+                        r["hot_theme_boost"] = round(boost, 4)
+                        r["final_score"] = round(float(r.get("signal_score", 0.0) or 0.0) + boost, 4)
+                except Exception:
+                    pass
+
+        if rows:
+            try:
+                history_codes = [str(r.get("symbol") or "") for r in rows if str(r.get("symbol") or "")]
+                history_meta = self.history_service.batch_query_stock_history_themes(history_codes, before_date=end8, max_themes=8)
+                history_items = (history_meta or {}).get("items", {}) or {}
+                for r in rows:
+                    code = str(r.get("symbol") or "")
+                    history_item = history_items.get(code) or {}
+                    r["history_themes"] = list(history_item.get("themes", []) or [])
+                    r["history_theme_source_date"] = str(history_item.get("theme_source_date", "") or "")
+                    r["history_themes_text"] = "、".join(r["history_themes"][:5]) if r["history_themes"] else ""
+            except Exception:
+                for r in rows:
+                    r["history_themes"] = []
+                    r["history_theme_source_date"] = ""
+                    r["history_themes_text"] = ""
+
+        rows.sort(
+            key=lambda x: (
+                float(x.get("final_score", x.get("signal_score", 0.0)) or 0.0),
+                float(x.get("restart_vol_ratio", 0.0) or 0.0),
+                float(x.get("strong_gain_pct", 0.0) or 0.0),
+            ),
+            reverse=True,
+        )
+        top_rows = rows[:max(1, int(top_n or 20))]
+        for i, r in enumerate(top_rows, 1):
+            r["rank"] = i
+
+        out["success"] = True
+        out["candidates"] = top_rows
+        if not top_rows:
+            out["error"] = "未找到满足强势回踩再启动规则的标的"
+        return out
+
+    def _detect_strong_pullback_restart(
+        self,
+        df: pd.DataFrame,
+        strong_lookback_days: int,
+        strong_min_gain_pct: float,
+        pullback_max_retrace: float,
+        pullback_max_vol_ratio: float,
+        restart_min_gain_pct: float,
+        restart_min_vol_ratio: float,
+    ) -> Dict[str, Any]:
+        if df is None or df.empty or len(df.index) < 12:
+            return {"hit": False, "reason": "bars_not_enough"}
+
+        work = df.copy().reset_index(drop=True)
+        close = pd.to_numeric(work.get("收盘"), errors="coerce")
+        high = pd.to_numeric(work.get("最高"), errors="coerce")
+        low = pd.to_numeric(work.get("最低"), errors="coerce")
+        vol = pd.to_numeric(work.get("成交量"), errors="coerce")
+        dates = pd.to_datetime(work.get("日期"), errors="coerce")
+
+        n = len(work.index)
+        win = min(max(20, int(strong_lookback_days)), n - 2)
+        start_idx = max(0, n - win - 1)
+        end_idx = n - 2
+
+        strong_start = -1
+        strong_end = -1
+        strong_gain_pct = 0.0
+        for i in range(start_idx, end_idx - 3):
+            c0 = float(close.iloc[i]) if pd.notna(close.iloc[i]) else 0.0
+            if c0 <= 0:
+                continue
+            for j in range(i + 2, end_idx + 1):
+                c1 = float(close.iloc[j]) if pd.notna(close.iloc[j]) else 0.0
+                if c1 <= 0:
+                    continue
+                gain = (c1 - c0) / c0 * 100.0
+                if gain >= float(strong_min_gain_pct):
+                    strong_start = i
+                    strong_end = j
+                    strong_gain_pct = gain
+
+        if strong_start < 0 or strong_end < 0:
+            return {"hit": False, "reason": "no_strong_leg"}
+
+        high_ref = float(pd.to_numeric(high.iloc[strong_start:strong_end + 1], errors="coerce").dropna().max() or 0.0)
+        base_ref = float(close.iloc[strong_start]) if pd.notna(close.iloc[strong_start]) else 0.0
+        if high_ref <= 0 or base_ref <= 0 or high_ref <= base_ref:
+            return {"hit": False, "reason": "invalid_strong_leg"}
+
+        pullback_low_series = pd.to_numeric(low.iloc[strong_end + 1:n], errors="coerce").dropna()
+        if pullback_low_series.empty:
+            return {"hit": False, "reason": "no_pullback"}
+        pullback_low = float(pullback_low_series.min())
+        retrace_ratio = (high_ref - pullback_low) / max(high_ref - base_ref, 1e-9)
+        if retrace_ratio > float(pullback_max_retrace):
+            return {"hit": False, "reason": f"retrace_too_large({retrace_ratio:.3f})"}
+
+        pullback_vol_series = pd.to_numeric(vol.iloc[strong_end + 1:n], errors="coerce").dropna()
+        strong_vol_series = pd.to_numeric(vol.iloc[strong_start:strong_end + 1], errors="coerce").dropna()
+        if pullback_vol_series.empty or strong_vol_series.empty:
+            return {"hit": False, "reason": "vol_not_enough"}
+        pullback_vol_ratio = float(pullback_vol_series.mean()) / max(float(strong_vol_series.mean()), 1e-9)
+        if pullback_vol_ratio > float(pullback_max_vol_ratio):
+            return {"hit": False, "reason": f"pullback_vol_too_high({pullback_vol_ratio:.3f})"}
+
+        restart_idx = n - 1
+        if restart_idx <= strong_end:
+            return {"hit": False, "reason": "no_restart_bar"}
+        prev_close = float(close.iloc[restart_idx - 1]) if pd.notna(close.iloc[restart_idx - 1]) else 0.0
+        now_close = float(close.iloc[restart_idx]) if pd.notna(close.iloc[restart_idx]) else 0.0
+        if prev_close <= 0 or now_close <= 0:
+            return {"hit": False, "reason": "invalid_restart_price"}
+        restart_gain_pct = (now_close - prev_close) / prev_close * 100.0
+        if restart_gain_pct < float(restart_min_gain_pct):
+            return {"hit": False, "reason": f"restart_gain_low({restart_gain_pct:.2f})"}
+
+        prev5 = pd.to_numeric(vol.iloc[max(0, restart_idx - 5):restart_idx], errors="coerce").dropna()
+        prev5_mean = float(prev5.mean()) if not prev5.empty else 0.0
+        now_vol = float(vol.iloc[restart_idx]) if pd.notna(vol.iloc[restart_idx]) else 0.0
+        if now_vol <= 0 or prev5_mean <= 0:
+            return {"hit": False, "reason": "invalid_restart_vol"}
+        restart_vol_ratio = now_vol / prev5_mean
+        if restart_vol_ratio < float(restart_min_vol_ratio):
+            return {"hit": False, "reason": f"restart_vol_low({restart_vol_ratio:.2f})"}
+
+        strong_start_date = pd.to_datetime(dates.iloc[strong_start]).strftime("%Y-%m-%d") if pd.notna(dates.iloc[strong_start]) else ""
+        strong_end_date = pd.to_datetime(dates.iloc[strong_end]).strftime("%Y-%m-%d") if pd.notna(dates.iloc[strong_end]) else ""
+        restart_date = pd.to_datetime(dates.iloc[restart_idx]).strftime("%Y-%m-%d") if pd.notna(dates.iloc[restart_idx]) else ""
+
+        score = 1.0
+        score += min(2.0, max(0.0, (strong_gain_pct - float(strong_min_gain_pct)) / 10.0))
+        score += min(1.2, max(0.0, (float(pullback_max_retrace) - retrace_ratio) * 2.4))
+        score += min(1.2, max(0.0, (float(pullback_max_vol_ratio) - pullback_vol_ratio) * 2.5))
+        score += min(1.2, max(0.0, (restart_vol_ratio - float(restart_min_vol_ratio)) * 0.8))
+
+        return {
+            "hit": True,
+            "reason": f"强势涨幅{strong_gain_pct:.2f}%, 回撤{retrace_ratio:.2f}, 回踩量比{pullback_vol_ratio:.2f}, 再启动量比{restart_vol_ratio:.2f}",
+            "score": score,
+            "strong_start_date": strong_start_date,
+            "strong_end_date": strong_end_date,
+            "strong_gain_pct": strong_gain_pct,
+            "pullback_retrace_ratio": retrace_ratio,
+            "pullback_vol_ratio": pullback_vol_ratio,
+            "restart_date": restart_date,
+            "restart_gain_pct": restart_gain_pct,
+            "restart_vol_ratio": restart_vol_ratio,
+            "latest_close": now_close,
+        }
 
     def _detect_bottom_volume_arbitrage(
         self,

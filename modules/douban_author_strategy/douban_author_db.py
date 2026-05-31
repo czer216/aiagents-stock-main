@@ -41,6 +41,44 @@ class DoubanAuthorDatabase:
 
         cursor.execute(
             '''
+            CREATE TABLE IF NOT EXISTS douban_post_comments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                author_id TEXT NOT NULL,
+                post_id INTEGER,
+                post_url TEXT NOT NULL,
+                comment_id TEXT NOT NULL,
+                comment_text TEXT NOT NULL,
+                comment_time TEXT,
+                comment_user TEXT,
+                like_count INTEGER DEFAULT 0,
+                page_idx INTEGER DEFAULT 1,
+                fetched_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(post_url, comment_id)
+            )
+            '''
+        )
+        cursor.execute('CREATE INDEX IF NOT EXISTS idx_douban_post_comments_post ON douban_post_comments(post_url, fetched_at DESC)')
+
+        cursor.execute(
+            '''
+            CREATE TABLE IF NOT EXISTS douban_post_comment_summaries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                author_id TEXT NOT NULL,
+                post_id INTEGER,
+                post_url TEXT NOT NULL,
+                comment_count INTEGER DEFAULT 0,
+                sentiment_score REAL DEFAULT 50,
+                sentiment_label TEXT,
+                operation_bias_json TEXT,
+                summary_json TEXT,
+                analyzed_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(post_url)
+            )
+            '''
+        )
+
+        cursor.execute(
+            '''
             CREATE TABLE IF NOT EXISTS douban_pattern_reports (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 author_id TEXT NOT NULL,
@@ -178,6 +216,9 @@ class DoubanAuthorDatabase:
             "ALTER TABLE douban_author_patterns MODIFY pattern_json LONGTEXT",
             "ALTER TABLE douban_author_patterns MODIFY summary LONGTEXT",
             "ALTER TABLE douban_author_patterns MODIFY source_post_ids LONGTEXT",
+            "ALTER TABLE douban_post_comments MODIFY comment_text LONGTEXT",
+            "ALTER TABLE douban_post_comment_summaries MODIFY operation_bias_json LONGTEXT",
+            "ALTER TABLE douban_post_comment_summaries MODIFY summary_json LONGTEXT",
         ]
         for sql in alters:
             try:
@@ -220,6 +261,105 @@ class DoubanAuthorDatabase:
             LIMIT ?
             ''',
             (author_id, int(limit)),
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return rows
+
+    def upsert_post_comment(self, author_id: str, post_id: Optional[int], post_url: str, comment: Dict) -> int:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        comment_id = str(comment.get('comment_id') or '').strip()
+        if not comment_id:
+            raw = f"{post_url}|{comment.get('comment_time') or ''}|{comment.get('comment_text') or ''}"
+            comment_id = str(abs(hash(raw)))
+        cursor.execute(
+            '''
+            INSERT OR REPLACE INTO douban_post_comments
+            (author_id, post_id, post_url, comment_id, comment_text, comment_time, comment_user, like_count, page_idx, fetched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                str(author_id or ''),
+                int(post_id) if post_id else None,
+                str(post_url or ''),
+                comment_id,
+                str(comment.get('comment_text') or ''),
+                str(comment.get('comment_time') or ''),
+                str(comment.get('comment_user') or ''),
+                int(comment.get('like_count') or 0),
+                int(comment.get('page_idx') or 1),
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            ),
+        )
+        conn.commit()
+        rid = int(cursor.lastrowid or 0)
+        conn.close()
+        return rid
+
+    def replace_post_comment_summary(
+        self,
+        author_id: str,
+        post_id: Optional[int],
+        post_url: str,
+        comment_count: int,
+        sentiment_score: float,
+        sentiment_label: str,
+        operation_bias: Dict,
+        summary_payload: Dict,
+    ) -> int:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT OR REPLACE INTO douban_post_comment_summaries
+            (author_id, post_id, post_url, comment_count, sentiment_score, sentiment_label, operation_bias_json, summary_json, analyzed_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                str(author_id or ''),
+                int(post_id) if post_id else None,
+                str(post_url or ''),
+                int(comment_count or 0),
+                float(sentiment_score or 50),
+                str(sentiment_label or ''),
+                json.dumps(operation_bias or {}, ensure_ascii=False),
+                json.dumps(summary_payload or {}, ensure_ascii=False),
+                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            ),
+        )
+        conn.commit()
+        rid = int(cursor.lastrowid or 0)
+        conn.close()
+        return rid
+
+    def list_post_comments(self, post_url: str, limit: int = 500) -> List[Dict]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT * FROM douban_post_comments
+            WHERE post_url = ?
+            ORDER BY id DESC
+            LIMIT ?
+            ''',
+            (str(post_url or ''), int(limit)),
+        )
+        rows = [dict(r) for r in cursor.fetchall()]
+        conn.close()
+        return rows
+
+    def list_comment_summaries(self, author_id: str, limit: int = 50) -> List[Dict]:
+        conn = self.get_connection()
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT * FROM douban_post_comment_summaries
+            WHERE author_id = ?
+            ORDER BY analyzed_at DESC, id DESC
+            LIMIT ?
+            ''',
+            (str(author_id or ''), int(limit)),
         )
         rows = [dict(r) for r in cursor.fetchall()]
         conn.close()

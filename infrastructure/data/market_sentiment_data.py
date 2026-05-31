@@ -3,10 +3,12 @@
 使用akshare获取市场情绪相关指标，包括ARBR、恐慌指数、市场资金情绪等
 """
 
+import os
 import pandas as pd
 import numpy as np
 import akshare as ak
 from datetime import datetime, timedelta
+from pathlib import Path
 import warnings
 import sys
 import io
@@ -35,9 +37,107 @@ _setup_stdout_encoding()
 
 class MarketSentimentDataFetcher:
     """市场情绪数据获取和计算类"""
-    
+
     def __init__(self):
         self.arbr_period = 26  # ARBR计算周期
+        self._external_manager = None
+        self._external_manager_checked = False
+
+    @staticmethod
+    def _to_float(value, default=0.0):
+        try:
+            if value is None:
+                return float(default)
+            text = str(value).strip().replace('%', '').replace(',', '')
+            if text in {'', '--', 'None', 'nan', 'NaN'}:
+                return float(default)
+            return float(text)
+        except Exception:
+            return float(default)
+
+    def _get_external_manager(self):
+        if self._external_manager_checked:
+            return self._external_manager
+
+        self._external_manager_checked = True
+        candidates = [
+            Path('/Users/cz/daily_stock_analysis'),
+            Path(__file__).resolve().parents[2] / 'daily_stock_analysis',
+        ]
+        for base_path in candidates:
+            try:
+                if not base_path.exists():
+                    continue
+                if str(base_path) not in sys.path:
+                    sys.path.insert(0, str(base_path))
+                from data_provider.base import DataFetcherManager  # type: ignore
+                self._external_manager = DataFetcherManager()
+                print(f"   [External] 已接入 daily_stock_analysis: {base_path}")
+                break
+            except Exception as e:
+                print(f"   [External] 接入 daily_stock_analysis 失败: {e}")
+                self._external_manager = None
+
+        return self._external_manager
+
+    def _build_market_index_payload(self, change_percent=None, up_count=0, down_count=0, flat_count=0, total_count=0, sentiment_score=0.0, sentiment_interpretation='市场情绪数据暂不可用'):
+        return {
+            "index_name": "上证指数",
+            "change_percent": self._to_float(change_percent, 0.0),
+            "up_count": int(up_count or 0),
+            "down_count": int(down_count or 0),
+            "flat_count": int(flat_count or 0),
+            "total_count": int(total_count or 0),
+            "sentiment_score": f"{self._to_float(sentiment_score, 0.0):.2f}",
+            "sentiment_interpretation": str(sentiment_interpretation or '市场情绪数据暂不可用'),
+        }
+
+    def _classify_market_sentiment(self, sentiment_score):
+        score = self._to_float(sentiment_score, 0.0)
+        if score > 30:
+            return "市场情绪极度乐观"
+        if score > 10:
+            return "市场情绪偏多"
+        if score > -10:
+            return "市场情绪中性"
+        if score > -30:
+            return "市场情绪偏空"
+        return "市场情绪极度悲观"
+
+    def _get_market_index_via_external_manager(self):
+        manager = self._get_external_manager()
+        if not manager:
+            return None
+
+        try:
+            indices = manager.get_main_indices(region='cn') or []
+            sh_index = next((item for item in indices if str(item.get('code') or '').strip() == 'sh000001'), None)
+            stats = manager.get_market_stats() or {}
+            if not sh_index:
+                return None
+
+            change_percent = self._to_float(sh_index.get('change_pct') or sh_index.get('change_percent'), 0.0)
+            up_count = int(stats.get('up_count') or 0)
+            down_count = int(stats.get('down_count') or 0)
+            flat_count = int(stats.get('flat_count') or 0)
+            total_count = int(up_count + down_count + flat_count)
+            sentiment_score = 0.0
+            if total_count > 0:
+                sentiment_score = (up_count - down_count) / total_count * 100
+            sentiment = self._classify_market_sentiment(sentiment_score)
+            print("   [External] ✅ 成功获取大盘与涨跌家数")
+            return self._build_market_index_payload(
+                change_percent=change_percent,
+                up_count=up_count,
+                down_count=down_count,
+                flat_count=flat_count,
+                total_count=total_count,
+                sentiment_score=sentiment_score,
+                sentiment_interpretation=sentiment,
+            )
+        except Exception as e:
+            print(f"   [External] 获取大盘数据失败: {e}")
+            return None
     
     def get_market_sentiment_data(self, symbol, stock_data=None):
         """
@@ -412,90 +512,69 @@ class MarketSentimentDataFetcher:
         return None
     
     def _get_market_index_sentiment(self):
-        """获取大盘指数情绪（支持akshare和tushare自动切换）"""
+        """获取大盘指数情绪（external manager -> akshare -> tushare）"""
+        fallback = self._build_market_index_payload()
+
+        external_payload = self._get_market_index_via_external_manager()
+        if external_payload:
+            return external_payload
+
         try:
-            # 优先使用akshare获取上证指数实时数据
             print(f"   [Akshare] 正在获取大盘指数数据...")
-            # 使用正确的symbol参数
             df = ak.stock_zh_index_spot_em(symbol="上证系列指数")
             if df is not None and not df.empty:
-                # 查找上证指数（代码为000001）
-                sh_index = df[df['代码'] == '000001']
+                sh_index = df[df['代码'].astype(str) == '000001']
                 if not sh_index.empty:
                     row = sh_index.iloc[0]
-                    change_pct = row.get('涨跌幅', 0)
-                    
-                    # 获取涨跌家数
+                    change_pct = self._to_float(row.get('涨跌幅', 0), 0.0)
+                    fallback = self._build_market_index_payload(change_percent=change_pct)
+
                     try:
                         market_summary = ak.stock_zh_a_spot_em()
-                        if market_summary is not None and not market_summary.empty:
-                            up_count = len(market_summary[market_summary['涨跌幅'] > 0])
-                            down_count = len(market_summary[market_summary['涨跌幅'] < 0])
-                            total_count = len(market_summary)
-                            flat_count = total_count - up_count - down_count
-                            
-                            # 计算市场情绪指数
-                            sentiment_score = (up_count - down_count) / total_count * 100
-                            
-                            # 解读市场情绪
-                            if sentiment_score > 30:
-                                sentiment = "市场情绪极度乐观"
-                            elif sentiment_score > 10:
-                                sentiment = "市场情绪偏多"
-                            elif sentiment_score > -10:
-                                sentiment = "市场情绪中性"
-                            elif sentiment_score > -30:
-                                sentiment = "市场情绪偏空"
-                            else:
-                                sentiment = "市场情绪极度悲观"
-                            
+                        if market_summary is not None and not market_summary.empty and '涨跌幅' in market_summary.columns:
+                            pct_series = pd.to_numeric(market_summary['涨跌幅'], errors='coerce').fillna(0.0)
+                            up_count = int((pct_series > 0).sum())
+                            down_count = int((pct_series < 0).sum())
+                            total_count = int(len(pct_series))
+                            flat_count = max(0, total_count - up_count - down_count)
+
+                            sentiment_score = ((up_count - down_count) / total_count * 100) if total_count > 0 else 0.0
+                            sentiment = self._classify_market_sentiment(sentiment_score)
                             print(f"   [Akshare] ✅ 成功获取大盘数据")
-                            return {
-                                "index_name": "上证指数",
-                                "change_percent": change_pct,
-                                "up_count": up_count,
-                                "down_count": down_count,
-                                "flat_count": flat_count,
-                                "total_count": total_count,
-                                "sentiment_score": f"{sentiment_score:.2f}",
-                                "sentiment_interpretation": sentiment
-                            }
+                            return self._build_market_index_payload(
+                                change_percent=change_pct,
+                                up_count=up_count,
+                                down_count=down_count,
+                                flat_count=flat_count,
+                                total_count=total_count,
+                                sentiment_score=sentiment_score,
+                                sentiment_interpretation=sentiment,
+                            )
                     except Exception as e:
                         print(f"   [Akshare] 获取涨跌家数失败: {e}")
-                    
+
                     print(f"   [Akshare] ✅ 成功获取指数涨跌幅")
-                    return {
-                        "index_name": "上证指数",
-                        "change_percent": change_pct
-                    }
+                    return fallback
         except Exception as e:
             print(f"   [Akshare] ❌ 获取大盘指数失败: {e}")
-            
-            # akshare失败，尝试tushare
-            if data_source_manager.tushare_available:
-                try:
-                    print(f"   [Tushare] 正在获取大盘指数数据（备用数据源）...")
-                    
-                    # 获取上证指数数据
-                    df = data_source_manager.tushare_api.index_daily(
-                        ts_code='000001.SH',
-                        start_date=datetime.now().strftime('%Y%m%d'),
-                        end_date=datetime.now().strftime('%Y%m%d')
-                    )
-                    
-                    if df is not None and not df.empty:
-                        row = df.iloc[0]
-                        change_pct = row.get('pct_chg', 0)
-                        
-                        print(f"   [Tushare] ✅ 成功获取大盘指数涨跌幅: {change_pct}%")
-                        return {
-                            "index_name": "上证指数",
-                            "change_percent": change_pct
-                        }
-                except Exception as te:
-                    print(f"   [Tushare] ❌ 获取失败: {te}")
-        
-        return None
+
+        if data_source_manager.tushare_available:
+            try:
+                print(f"   [Tushare] 正在获取大盘指数数据（备用数据源）...")
+                df = data_source_manager.tushare_api.index_daily(
+                    ts_code='000001.SH',
+                    start_date=datetime.now().strftime('%Y%m%d'),
+                    end_date=datetime.now().strftime('%Y%m%d')
+                )
+                if df is not None and not df.empty:
+                    row = df.iloc[0]
+                    change_pct = self._to_float(row.get('pct_chg', 0), 0.0)
+                    print(f"   [Tushare] ✅ 成功获取大盘指数涨跌幅: {change_pct}%")
+                    return self._build_market_index_payload(change_percent=change_pct)
+            except Exception as te:
+                print(f"   [Tushare] ❌ 获取失败: {te}")
+
+        return fallback
     
     def _get_limit_up_down_stats(self):
         """获取涨跌停统计数据"""

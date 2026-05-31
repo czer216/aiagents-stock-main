@@ -5417,7 +5417,7 @@ class LonghubangEngine:
             "error": "",
         }
         try:
-            from notification_service import notification_service
+            from infrastructure.notification.notification_service import notification_service
 
             webhook_cfg = notification_service.get_webhook_config_status()
             enabled = bool(webhook_cfg.get("enabled"))

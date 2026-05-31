@@ -141,7 +141,7 @@ def _render_tdx_quote_panel(candidate: Dict):
     m1.metric("最新价", f"{price:.3f}")
     m2.metric("涨跌幅", f"{chg_pct:.2f}%")
     m3.metric("成交量(手)", f"{int(raw.get('TotalHand') or 0)}")
-    m4.metric("成交额(元)", f"{float(raw.get('Amount') or 0)/1000:.0f}")
+    m4.metric("成交额(万元)", f"{float(raw.get('Amount') or 0)/100000:.0f}")
 
     c1, c2 = st.columns(2)
     buy = raw.get('BuyLevel') or []
@@ -242,6 +242,20 @@ def _render_candidate_analysis_panel(candidate: Dict):
         st.caption(f"行情时间: {candidate.get('rt_update_time')}")
     if candidate.get('rt_source'):
         st.caption(f"数据源: {candidate.get('rt_source')}")
+    if candidate.get('rerank_score') is not None:
+        st.caption(f"盘中重排分: {candidate.get('rerank_score')}")
+    if candidate.get('intraday_score') is not None:
+        st.caption(f"分时结构分: {candidate.get('intraday_score')}")
+    if candidate.get('next_day_prior_score') is not None:
+        st.caption(f"次日倾向分: {candidate.get('next_day_prior_score')}")
+    feat = candidate.get('intraday_features') or {}
+    if feat:
+        st.caption(
+            f"拉升节奏:{feat.get('pull_rhythm_score')} | 量价配合:{feat.get('volume_price_score')} | 回落承接:{feat.get('pullback_support_score')}"
+        )
+    risk_flags = candidate.get('risk_flags') or {}
+    if risk_flags.get('missing_intraday_data'):
+        st.warning('分时数据不足，已回退到基础排序')
     st.markdown("**推荐理由**")
     st.write(str(candidate.get('reason') or '未提供'))
 
@@ -310,15 +324,54 @@ def display_douban_author_strategy():
         topic_urls_text = st.text_area("帖子URL列表(每行一个)", value=st.session_state.get("douban_topic_urls", ""), height=120)
         st.caption("提示：完整URL一行一个，并确认 DOUBAN_COOKIE 有效。")
 
+    cc1, cc2, cc3, cc4 = st.columns(4)
+    with cc1:
+        enable_comment_analysis = st.checkbox(
+            "学习后自动抓取评论并总结",
+            value=bool(st.session_state.get("douban_enable_comment_analysis", True)),
+            key="douban_enable_comment_analysis_checkbox",
+        )
+    with cc2:
+        comment_start_page = st.number_input(
+            "评论起始页",
+            min_value=1,
+            max_value=2000,
+            value=int(st.session_state.get("douban_comment_start_page", 1)),
+            step=1,
+            key="douban_comment_start_page_input",
+        )
+    with cc3:
+        comment_max_pages = st.number_input(
+            "评论抓取页数",
+            min_value=1,
+            max_value=500,
+            value=int(st.session_state.get("douban_comment_max_pages", 30)),
+            step=1,
+            key="douban_comment_max_pages_input",
+        )
+    with cc4:
+        st.caption("实际抓取区间")
+        st.write(f"第 {int(comment_start_page)} 页 ~ 第 {int(comment_start_page) + int(comment_max_pages) - 1} 页")
     topic_urls = _parse_urls(topic_urls_text)
 
     st.session_state["douban_author_id"] = author_id
     st.session_state["douban_author_name"] = author_name
     st.session_state["douban_daily_time"] = daily_time
     st.session_state["douban_topic_urls"] = topic_urls_text
+    st.session_state["douban_enable_comment_analysis"] = bool(enable_comment_analysis)
+    st.session_state["douban_comment_start_page"] = int(comment_start_page)
+    st.session_state["douban_comment_max_pages"] = int(comment_max_pages)
 
     scheduler = get_douban_author_scheduler()
-    scheduler.configure(author_id=author_id, author_name=author_name, topic_urls=topic_urls, daily_time=daily_time)
+    scheduler.configure(
+        author_id=author_id,
+        author_name=author_name,
+        topic_urls=topic_urls,
+        daily_time=daily_time,
+        enable_comment_analysis=bool(enable_comment_analysis),
+        comment_max_pages=int(comment_max_pages),
+        comment_start_page=int(comment_start_page),
+    )
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -357,7 +410,74 @@ def display_douban_author_strategy():
         st.caption(f"状态: {'运行中' if scheduler.running else '已停止'}")
 
     st.markdown("---")
-    st.subheader("2) 作者模式库")
+    st.subheader("1.5) 评论抓取与情绪总结")
+    if st.button("💬 抓取评论并总结", key="douban_comment_run_now", width='stretch'):
+        with st.spinner("评论分析执行中..."):
+            result = douban_author_engine.analyze_topic_comments(
+                author_id=author_id,
+                topic_urls=topic_urls,
+                max_pages=int(comment_max_pages),
+                start_page=int(comment_start_page),
+            )
+        if result.get('success'):
+            st.success(f"评论分析完成: topic={result.get('topic_count')} | 评论总数={result.get('total_comments')}")
+            errs = result.get('errors') or []
+            if errs:
+                for er in errs[:5]:
+                    st.warning(f"抓取异常: {er.get('post_url')} | {er.get('error')}")
+        else:
+            st.error(f"评论分析失败: {result.get('error')}")
+
+    recent_comment_summaries = douban_author_db.list_comment_summaries(author_id=author_id, limit=10)
+    if recent_comment_summaries:
+        with st.expander("查看最近评论情绪汇总", expanded=False):
+            for sm in recent_comment_summaries:
+                summary_payload = {}
+                try:
+                    summary_payload = json.loads(sm.get('summary_json') or '{}')
+                except Exception:
+                    summary_payload = {}
+                st.markdown(f"**{sm.get('post_url')}**")
+                st.caption(
+                    f"评论数: {int(sm.get('comment_count') or 0)} | 情绪: {sm.get('sentiment_label') or '中性'} "
+                    f"({float(sm.get('sentiment_score') or 50):.1f})"
+                )
+                if sm.get('comment_count') == 0 and summary_payload.get('summary_text') == '暂无评论数据':
+                    st.warning('该URL本次未抓到评论，可能是Cookie失效、页面结构变化或页码区间无数据。')
+                st.write(str(summary_payload.get('summary_text') or ''))
+                discussion_overview = str(summary_payload.get('discussion_overview') or '').strip()
+                topic_list = summary_payload.get('top_discussion_topics') or []
+                if discussion_overview:
+                    st.info(f"讨论总览: {discussion_overview}")
+                if topic_list:
+                    st.caption("高频讨论话题: " + "、".join([str(x) for x in topic_list[:8]]))
+                viewpoint = summary_payload.get('viewpoint_summary') or {}
+                rep_comments = summary_payload.get('representative_comments') or {}
+
+                k1, k2, k3 = st.columns(3)
+                with k1:
+                    st.caption("看多关键词")
+                    st.write("、".join([str(x) for x in (viewpoint.get('bullish') or [])]) or "-")
+                with k2:
+                    st.caption("看空关键词")
+                    st.write("、".join([str(x) for x in (viewpoint.get('bearish') or [])]) or "-")
+                with k3:
+                    st.caption("观望关键词")
+                    st.write("、".join([str(x) for x in (viewpoint.get('neutral') or [])]) or "-")
+
+                for label, key in [("代表性看多评论", "bullish"), ("代表性看空评论", "bearish"), ("代表性观望评论", "neutral")]:
+                    rows = rep_comments.get(key) or []
+                    if not rows:
+                        continue
+                    st.markdown(f"**{label}**")
+                    for row in rows[:3]:
+                        user = str(row.get('comment_user') or '匿名')
+                        ctime = str(row.get('comment_time') or '')
+                        likes = int(row.get('like_count') or 0)
+                        text = str(row.get('comment_text') or '').strip()
+                        st.markdown(f"- [{user}] {ctime} 👍{likes}\\n  {text}")
+
+    st.markdown("---")
     authors = douban_author_db.list_authors(limit=200)
     if not authors:
         st.info("暂无作者模式，请先执行学习")
@@ -388,6 +508,35 @@ def display_douban_author_strategy():
         else:
             pattern_version = 0
             st.info("该作者暂无模式版本，请先学习")
+
+    st.markdown("---")
+    st.subheader("2.5) 作者反馈融合到最新交易库")
+    feedback_default = (
+        "模型形态符合主升中断板低吸；但实盘会考虑筹码图形和历史股性等主观因素。"
+        "像远东这类历史股性偏趋势、少隔日反包的票，可能会入选但通常不参与。"
+    )
+    feedback_text = st.text_area(
+        "作者反馈文本",
+        value=st.session_state.get("douban_author_feedback_text", feedback_default),
+        height=90,
+        key="douban_author_feedback_text_area",
+    )
+    st.session_state["douban_author_feedback_text"] = feedback_text
+
+    if st.button("🧩 融合反馈到最新交易库", key="merge_feedback_pattern_btn", width='stretch'):
+        merge_result = douban_author_engine.merge_author_feedback_to_latest_pattern(
+            author_id=selected_author_id,
+            author_name=selected_author_name,
+            feedback_text=feedback_text,
+            reviewed_by='admin',
+        )
+        if merge_result.get('success'):
+            st.success(
+                f"已融合成功：v{merge_result.get('previous_version')} -> v{merge_result.get('new_version')}"
+            )
+            st.rerun()
+        else:
+            st.error(f"融合失败: {merge_result.get('error', '未知错误')}")
 
     st.markdown("---")
     st.subheader("3) 按选中作者模式推荐选股")

@@ -1,6 +1,7 @@
 import time
 import json
 import logging
+import statistics
 from datetime import datetime, timedelta
 from typing import Dict, List
 
@@ -10,6 +11,7 @@ from infrastructure.data.stock_data import StockDataFetcher
 from modules.douban_author_strategy.douban_author_data import DoubanAuthorDataFetcher
 from modules.douban_author_strategy.douban_author_db import douban_author_db
 from modules.douban_author_strategy.douban_author_agents import DoubanAuthorAgents
+from modules.douban_author_strategy.douban_author_comment_analyzer import comment_analyzer
 from modules.smart_monitor.smart_monitor_data import SmartMonitorDataFetcher
 from infrastructure.data.market_sentiment_data import MarketSentimentDataFetcher
 import config
@@ -24,6 +26,100 @@ class DoubanAuthorStrategyEngine:
         self.stock_fetcher = StockDataFetcher()
         self.rt_fetcher = SmartMonitorDataFetcher()
         self.sentiment_fetcher = MarketSentimentDataFetcher()
+
+    def merge_author_feedback_to_latest_pattern(
+        self,
+        author_id: str,
+        author_name: str,
+        feedback_text: str,
+        reviewed_by: str = 'admin',
+    ) -> Dict:
+        aid = str(author_id or '').strip()
+        if not aid:
+            return {"success": False, "error": "author_id不能为空"}
+
+        latest = self.db.get_latest_author_pattern(author_id=aid)
+        if not latest:
+            return {"success": False, "error": "该作者暂无模式版本，无法融合反馈"}
+
+        try:
+            pattern_json = json.loads(latest.get('pattern_json') or '{}')
+        except Exception:
+            pattern_json = {}
+        if not isinstance(pattern_json, dict):
+            pattern_json = {}
+
+        feedback = str(feedback_text or '').strip()
+        if not feedback:
+            feedback = (
+                "模型形态符合主升中断板低吸；实盘需结合筹码图形和历史股性主观过滤；"
+                "对偏趋势且历史少隔日反包标的，入选但通常不参与（示例：远东）。"
+            )
+
+        pattern_json['subjective_filters'] = {
+            'enabled': True,
+            'notes': feedback,
+            'focus': ['筹码图形', '历史股性'],
+        }
+        pattern_json['stock_character_constraints'] = {
+            'trend_style_skip_rebound_weak': True,
+            'notes': '偏趋势、历史少隔日反包的标的，通常不参与隔日反包型执行',
+        }
+        pattern_json['chip_structure_preference'] = {
+            'require_readable_chip_structure': True,
+            'notes': '入场前优先确认筹码结构是否支持次日反包/承接',
+        }
+        pattern_json['pass_but_skip_examples'] = [
+            {
+                'symbol_or_name': '远东',
+                'reason': '历史股性偏趋势，少隔日反包，可入选但通常不参与',
+            }
+        ]
+
+        base_source_post_ids = []
+        try:
+            base_source_post_ids = json.loads(latest.get('source_post_ids') or '[]')
+        except Exception:
+            base_source_post_ids = []
+        if not isinstance(base_source_post_ids, list):
+            base_source_post_ids = []
+
+        confidence = float((pattern_json or {}).get('confidence') or latest.get('confidence') or 0)
+        row_id = self.db.save_author_pattern(
+            author_id=aid,
+            pattern_json=pattern_json,
+            source_post_ids=base_source_post_ids,
+            confidence=confidence,
+            as_of_date=datetime.now().strftime('%Y-%m-%d'),
+        )
+        newest = self.db.get_latest_author_pattern(author_id=aid) or {}
+        new_version = int(newest.get('pattern_version') or 0)
+
+        lesson_payload = {
+            'type': 'author_feedback_merge',
+            'author_name': str(author_name or aid),
+            'reviewed_by': str(reviewed_by or 'admin'),
+            'feedback': feedback,
+            'merged_pattern_version': new_version,
+            'merged_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
+        self.db.save_learning_memory(
+            author_id=aid,
+            report_id=None,
+            memory_type='lesson',
+            memory_json=lesson_payload,
+            quality_score=0.8,
+        )
+
+        return {
+            'success': True,
+            'author_id': aid,
+            'author_name': str(author_name or aid),
+            'pattern_row_id': int(row_id),
+            'previous_version': int(latest.get('pattern_version') or 0),
+            'new_version': new_version,
+            'merged_feedback': feedback,
+        }
 
     def _fetch_realtime_with_retry(self, code: str, retries: int = 3, retry_delay: float = 0.6) -> Dict:
         last_quote = {}
@@ -46,6 +142,113 @@ class DoubanAuthorStrategyEngine:
             if i < retries - 1:
                 time.sleep(retry_delay)
         return last_quote
+
+    @staticmethod
+    def _safe_float(v, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except Exception:
+            return float(default)
+
+    def _get_intraday_raw(self, code: str) -> Dict:
+        tdx_fetcher = getattr(self.rt_fetcher, 'tdx_fetcher', None)
+        if not tdx_fetcher:
+            return {'minute': [], 'trade': [], 'quote': {}}
+        minute = tdx_fetcher.get_minute_data(code, limit=240) if hasattr(tdx_fetcher, 'get_minute_data') else []
+        trade = tdx_fetcher.get_trade_data(code, limit=400) if hasattr(tdx_fetcher, 'get_trade_data') else []
+        quote = tdx_fetcher.get_realtime_quote(code) or {}
+        return {'minute': minute or [], 'trade': trade or [], 'quote': quote or {}}
+
+    def _calc_pull_rhythm_score(self, minute_rows: List[Dict]) -> float:
+        if not minute_rows or len(minute_rows) < 20:
+            return 50.0
+        prices = [self._safe_float(x.get('Price')) for x in minute_rows if self._safe_float(x.get('Price')) > 0]
+        if len(prices) < 20:
+            return 50.0
+        deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+        positive_ratio = sum(1 for d in deltas if d > 0) / max(1, len(deltas))
+        acceleration = sum(1 for i in range(1, len(deltas)) if deltas[i] > deltas[i - 1] > 0)
+        accel_ratio = acceleration / max(1, len(deltas) - 1)
+        hi = max(prices)
+        lo = min(prices)
+        swing_pct = ((hi - lo) / lo * 100) if lo > 0 else 0
+        overheat_penalty = min(20.0, max(0.0, swing_pct - 6.0) * 2.5)
+        score = 40 + positive_ratio * 35 + accel_ratio * 20 - overheat_penalty
+        return max(0.0, min(100.0, score))
+
+    def _calc_volume_price_score(self, minute_rows: List[Dict], trade_rows: List[Dict]) -> float:
+        if not minute_rows or len(minute_rows) < 20:
+            return 50.0
+        prices = [self._safe_float(x.get('Price')) for x in minute_rows]
+        vols = [self._safe_float(x.get('Volume')) for x in minute_rows]
+        valid = [(p, v) for p, v in zip(prices, vols) if p > 0 and v >= 0]
+        if len(valid) < 20:
+            return 50.0
+        prices = [x[0] for x in valid]
+        vols = [x[1] for x in valid]
+        deltas = [prices[i] - prices[i - 1] for i in range(1, len(prices))]
+        up_vol = sum(vols[i] for i, d in enumerate(deltas, start=1) if d > 0)
+        down_vol = sum(vols[i] for i, d in enumerate(deltas, start=1) if d <= 0)
+        updown_ratio = up_vol / max(1.0, down_vol)
+        vol_mean = statistics.mean(vols) if vols else 0.0
+        vol_last = statistics.mean(vols[-20:]) if len(vols) >= 20 else vol_mean
+        vol_boost = vol_last / max(1.0, vol_mean)
+        buy_ratio = 0.5
+        if trade_rows:
+            buy = sum(self._safe_float(x.get('Volume')) for x in trade_rows if str(x.get('BuyOrSell') or '').lower().startswith('b'))
+            sell = sum(self._safe_float(x.get('Volume')) for x in trade_rows if str(x.get('BuyOrSell') or '').lower().startswith('s'))
+            if buy + sell > 0:
+                buy_ratio = buy / (buy + sell)
+        score = 35 + min(30.0, updown_ratio * 12) + min(20.0, max(0.0, vol_boost - 0.8) * 20) + buy_ratio * 20
+        return max(0.0, min(100.0, score))
+
+    def _calc_pullback_support_score(self, minute_rows: List[Dict], trade_rows: List[Dict], quote: Dict) -> float:
+        if not minute_rows or len(minute_rows) < 20:
+            return 50.0
+        prices = [self._safe_float(x.get('Price')) for x in minute_rows if self._safe_float(x.get('Price')) > 0]
+        avg_prices = [self._safe_float(x.get('AvgPrice')) for x in minute_rows if self._safe_float(x.get('AvgPrice')) > 0]
+        if len(prices) < 20:
+            return 50.0
+        peak = max(prices)
+        last = prices[-1]
+        retrace_pct = ((peak - last) / peak * 100) if peak > 0 else 0
+        vwap_hold = 0.5
+        if avg_prices:
+            avg_last = avg_prices[-1]
+            if avg_last > 0:
+                vwap_hold = 1.0 if last >= avg_last else max(0.0, 1 - (avg_last - last) / avg_last)
+        rebound = 0.0
+        if len(prices) > 8:
+            tail_low = min(prices[-8:])
+            rebound = ((last - tail_low) / tail_low * 100) if tail_low > 0 else 0
+        buy_ratio = 0.5
+        if trade_rows:
+            tail = trade_rows[-120:]
+            buy = sum(self._safe_float(x.get('Volume')) for x in tail if str(x.get('BuyOrSell') or '').lower().startswith('b'))
+            sell = sum(self._safe_float(x.get('Volume')) for x in tail if str(x.get('BuyOrSell') or '').lower().startswith('s'))
+            if buy + sell > 0:
+                buy_ratio = buy / (buy + sell)
+        score = 45 + (1 - min(1.0, retrace_pct / 4.0)) * 25 + vwap_hold * 15 + min(15.0, rebound * 5) + (buy_ratio - 0.5) * 20
+        return max(0.0, min(100.0, score))
+
+    def _load_next_day_prior_map(self, codes: List[str]) -> Dict[str, float]:
+        try:
+            from modules.longhubang.longhubang_p1_signals import AdvancedP1SignalFetcher
+            fetcher = AdvancedP1SignalFetcher()
+            payload = fetcher.get_signal_data(days=3, stock_codes=codes, next_day_focus=True)
+            stock_map = (payload or {}).get('stock_signal_map') or {}
+            out = {}
+            for code in codes:
+                raw = self._safe_float((stock_map.get(code) or {}).get('score'))
+                out[code] = max(0.0, min(100.0, raw / 1.2 * 100))
+            return out
+        except Exception:
+            return {}
+
+    def _calc_rerank_score(self, confidence: float, intraday_score: float, next_day_prior_score: float, overheat: bool) -> float:
+        penalty = 12.0 if overheat else 0.0
+        score = 0.60 * confidence + 0.25 * intraday_score + 0.15 * next_day_prior_score - penalty
+        return max(0.0, min(100.0, score))
 
     @staticmethod
     def _kline_last_10(df) -> List[Dict]:
@@ -495,8 +698,49 @@ class DoubanAuthorStrategyEngine:
         if not enriched:
             return {"success": False, "error": "TDX实时行情不可用，本次未生成盘中推荐"}
 
+        codes = [str(x.get('code') or '').strip() for x in enriched if str(x.get('code') or '').strip()]
+        prior_map = self._load_next_day_prior_map(codes)
+        for item in enriched:
+            code = str(item.get('code') or '').strip()
+            intraday_raw = self._get_intraday_raw(code)
+            minute_rows = intraday_raw.get('minute') or []
+            trade_rows = intraday_raw.get('trade') or []
+            quote_raw = intraday_raw.get('quote') or {}
+            pull_rhythm_score = self._calc_pull_rhythm_score(minute_rows)
+            volume_price_score = self._calc_volume_price_score(minute_rows, trade_rows)
+            pullback_support_score = self._calc_pullback_support_score(minute_rows, trade_rows, quote_raw)
+            intraday_score = max(0.0, min(100.0, 0.38 * pull_rhythm_score + 0.34 * volume_price_score + 0.28 * pullback_support_score))
+            confidence = self._safe_float(item.get('confidence'))
+            next_day_prior_score = self._safe_float(prior_map.get(code), 50.0)
+            overheat = self._safe_float(item.get('rt_change_pct')) >= 7.0
+            missing_intraday_data = (len(minute_rows) < 20)
+            if missing_intraday_data:
+                intraday_score = confidence
+            rerank_score = self._calc_rerank_score(
+                confidence=confidence,
+                intraday_score=intraday_score,
+                next_day_prior_score=next_day_prior_score,
+                overheat=overheat,
+            )
+            item['intraday_feature_version'] = 'tdx_intraday_v1'
+            item['intraday_score'] = round(intraday_score, 2)
+            item['next_day_prior_score'] = round(next_day_prior_score, 2)
+            item['rerank_score'] = round(rerank_score, 2)
+            item['intraday_features'] = {
+                'pull_rhythm_score': round(pull_rhythm_score, 2),
+                'volume_price_score': round(volume_price_score, 2),
+                'pullback_support_score': round(pullback_support_score, 2),
+                'minute_points': len(minute_rows),
+                'trade_points': len(trade_rows),
+            }
+            item['risk_flags'] = {
+                'overheat': bool(overheat),
+                'missing_intraday_data': bool(missing_intraday_data),
+            }
+
         def _score(x: Dict):
             return (
+                float(x.get('rerank_score') or x.get('confidence') or 0),
                 float(x.get('confidence') or 0),
                 -abs(float(x.get('rt_change_pct') or 0)),
             )
@@ -512,6 +756,13 @@ class DoubanAuthorStrategyEngine:
         intraday_payload['filtered_count'] = len(enriched)
         intraday_payload['skipped_count'] = int(skipped)
         intraday_payload['failed_count'] = int(failed)
+        intraday_payload['rerank_enabled'] = True
+        intraday_payload['rerank_formula_version'] = 'tdx_intraday_v1'
+        intraday_payload['feature_coverage_stats'] = {
+            'with_minute': int(sum(1 for x in enriched if not (x.get('risk_flags') or {}).get('missing_intraday_data'))),
+            'with_prior': int(sum(1 for x in enriched if self._safe_float(x.get('next_day_prior_score')) > 0)),
+            'total': int(len(enriched)),
+        }
 
         batch_id = datetime.now().strftime('intraday_%Y%m%d_%H%M%S')
         candidate_id = self.db.save_candidate(
@@ -545,6 +796,85 @@ class DoubanAuthorStrategyEngine:
             "batch_type": 'intraday_tdx',
             "batch_id": batch_id,
             "run_at": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
+
+    def analyze_topic_comments(
+        self,
+        author_id: str,
+        topic_urls: List[str],
+        max_pages: int = 3,
+        start_page: int = 1,
+        progress_cb=None,
+    ) -> Dict:
+        aid = str(author_id or '').strip()
+        urls = [str(u or '').strip() for u in (topic_urls or []) if str(u or '').strip()]
+        if not aid:
+            return {'success': False, 'error': 'author_id不能为空'}
+        if not urls:
+            return {'success': False, 'error': 'topic_urls为空'}
+
+        summaries = []
+        errors = []
+        total_comments = 0
+        for url in urls:
+            if callable(progress_cb):
+                progress_cb(f"抓取评论: {url}")
+            self.fetcher.last_errors = []
+            comments = self.fetcher.fetch_topic_comments(
+                url,
+                max_pages=max_pages,
+                start_page=start_page,
+            )
+            fetch_error = " ; ".join(self.fetcher.last_errors[:3]) if getattr(self.fetcher, 'last_errors', None) else ""
+            post_row = None
+            posts = self.db.get_posts_for_lookback(author_id=aid, limit=200)
+            for p in posts:
+                if str(p.get('post_url') or '').strip() == url:
+                    post_row = p
+                    break
+            post_id = int((post_row or {}).get('id') or 0) if post_row else None
+
+            for c in comments:
+                self.db.upsert_post_comment(
+                    author_id=aid,
+                    post_id=post_id,
+                    post_url=url,
+                    comment=c,
+                )
+            analysis = comment_analyzer.analyze_comments(comments)
+            self.db.replace_post_comment_summary(
+                author_id=aid,
+                post_id=post_id,
+                post_url=url,
+                comment_count=int(analysis.get('comment_count') or 0),
+                sentiment_score=float(analysis.get('sentiment_score') or 50),
+                sentiment_label=str(analysis.get('sentiment_label') or '中性'),
+                operation_bias=analysis.get('operation_bias') or {},
+                summary_payload=analysis,
+            )
+            total_comments += int(analysis.get('comment_count') or 0)
+            if fetch_error:
+                errors.append({'post_url': url, 'error': fetch_error})
+            summaries.append(
+                {
+                    'post_url': url,
+                    'comment_count': int(analysis.get('comment_count') or 0),
+                    'sentiment_label': str(analysis.get('sentiment_label') or '中性'),
+                    'sentiment_score': float(analysis.get('sentiment_score') or 50),
+                    'summary_text': str(analysis.get('summary_text') or ''),
+                    'operation_bias': analysis.get('operation_bias') or {},
+                    'fetch_error': fetch_error,
+                }
+            )
+
+        return {
+            'success': True,
+            'author_id': aid,
+            'topic_count': len(urls),
+            'total_comments': int(total_comments),
+            'summaries': summaries,
+            'errors': errors,
+            'run_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
         }
 
     def run_once(

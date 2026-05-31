@@ -20,12 +20,26 @@ class DoubanAuthorScheduler:
         self.author_id = "default_author"
         self.author_name = "豆瓣作者"
         self.topic_urls: List[str] = []
+        self.enable_comment_analysis = True
+        self.comment_start_page = 1
 
-    def configure(self, author_id: str, author_name: str, topic_urls: List[str], daily_time: str = "08:40"):
+    def configure(
+        self,
+        author_id: str,
+        author_name: str,
+        topic_urls: List[str],
+        daily_time: str = "08:40",
+        enable_comment_analysis: bool = True,
+        comment_max_pages: int = 3,
+        comment_start_page: int = 1,
+    ):
         self.author_id = author_id
         self.author_name = author_name
         self.topic_urls = [u for u in topic_urls if str(u or "").strip()]
         self.daily_time = daily_time or "08:40"
+        self.enable_comment_analysis = bool(enable_comment_analysis)
+        self.comment_max_pages = max(1, int(comment_max_pages or 3))
+        self.comment_start_page = max(1, int(comment_start_page or 1))
 
     def start(self):
         if self.running:
@@ -81,6 +95,15 @@ class DoubanAuthorScheduler:
                     lookback_days=60,
                     progress_cb=progress_cb,
                 )
+                if result.get("success") and self.enable_comment_analysis:
+                    comment_result = douban_author_engine.analyze_topic_comments(
+                        author_id=self.author_id,
+                        topic_urls=self.topic_urls,
+                        max_pages=int(self.comment_max_pages or 3),
+                        start_page=int(self.comment_start_page or 1),
+                        progress_cb=progress_cb,
+                    )
+                    result["comment_analysis"] = comment_result
                 if result.get("success"):
                     douban_author_db.save_scheduler_log(
                         task_type="daily_fetch_analyze",

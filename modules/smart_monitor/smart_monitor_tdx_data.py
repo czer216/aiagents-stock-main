@@ -6,7 +6,7 @@
 import logging
 import requests
 import pandas as pd
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from datetime import datetime, timedelta
 
 
@@ -26,7 +26,7 @@ class SmartMonitorTDXDataFetcher:
         
         self.logger.info(f"TDX数据源初始化成功，接口地址: {self.base_url}")
     
-    def get_realtime_quote(self, stock_code: str) -> Optional[Dict]:
+    def get_realtime_quote(self, stock_code: str, include_name: bool = True) -> Optional[Dict]:
         """
         获取实时行情
         
@@ -80,8 +80,8 @@ class SmartMonitorTDXDataFetcher:
             vol_ma5 = volume / 1.2  # 简化估算
             volume_ratio = volume / vol_ma5 if vol_ma5 > 0 else 1.0
             
-            # 获取股票名称（需要调用搜索接口）
-            stock_name = self._get_stock_name(stock_code)
+            # 获取股票名称（可选，避免高频场景额外 /api/search 开销）
+            stock_name = self._get_stock_name(stock_code) if bool(include_name) else 'N/A'
             
             self.logger.info(f"✅ TDX成功获取 {stock_code} ({stock_name}) 实时行情")
             
@@ -116,14 +116,18 @@ class SmartMonitorTDXDataFetcher:
                 'data_source': 'tdx'
             }
             
-        except requests.exceptions.Timeout:
-            self.logger.error(f"TDX请求超时 {stock_code}")
+        except requests.exceptions.Timeout as e:
+            self.logger.error(
+                f"TDX请求超时 code={stock_code} url={url} timeout={self.timeout}s err={type(e).__name__}: {str(e)}"
+            )
             return None
-        except requests.exceptions.ConnectionError:
-            self.logger.error(f"TDX连接失败，请检查接口地址: {self.base_url}")
+        except requests.exceptions.ConnectionError as e:
+            self.logger.error(
+                f"TDX连接失败 code={stock_code} url={url} timeout={self.timeout}s err={type(e).__name__}: {str(e)}"
+            )
             return None
         except Exception as e:
-            self.logger.error(f"TDX获取行情失败 {stock_code}: {type(e).__name__}: {str(e)}")
+            self.logger.error(f"TDX获取行情失败 code={stock_code} url={url}: {type(e).__name__}: {str(e)}")
             return None
     
     def _get_stock_name(self, stock_code: str) -> str:
@@ -151,8 +155,13 @@ class SmartMonitorTDXDataFetcher:
             
             return 'N/A'
             
+        except requests.exceptions.Timeout as e:
+            self.logger.error(
+                f"TDX名称请求超时 code={stock_code} url={url} timeout={self.timeout}s err={type(e).__name__}: {str(e)}"
+            )
+            return 'N/A'
         except Exception as e:
-            self.logger.warning(f"获取股票名称失败 {stock_code}: {e}")
+            self.logger.warning(f"获取股票名称失败 code={stock_code} url={url}: {type(e).__name__}: {str(e)}")
             return 'N/A'
     
     def get_kline_data(self, stock_code: str, kline_type: str = 'day', limit: int = 200) -> Optional[pd.DataFrame]:
@@ -215,10 +224,75 @@ class SmartMonitorTDXDataFetcher:
             
             return df
             
+        except requests.exceptions.Timeout as e:
+            self.logger.error(
+                f"TDX K线请求超时 code={stock_code} url={url} type={kline_type} timeout={self.timeout}s err={type(e).__name__}: {str(e)}"
+            )
+            return None
         except Exception as e:
-            self.logger.error(f"TDX获取K线失败 {stock_code}: {type(e).__name__}: {str(e)}")
+            self.logger.error(
+                f"TDX获取K线失败 code={stock_code} url={url} type={kline_type}: {type(e).__name__}: {str(e)}"
+            )
             return None
     
+    def get_minute_data(self, stock_code: str, limit: int = 240) -> List[Dict]:
+        """获取分时数据（/api/minute）"""
+        try:
+            url = f"{self.base_url}/api/minute"
+            params = {'code': stock_code}
+            response = requests.get(url, params=params, timeout=self.timeout)
+            result = response.json() if response is not None else {}
+            if result.get('code') != 0:
+                return []
+            rows = (result.get('data') or {}).get('List') or []
+            if not isinstance(rows, list):
+                return []
+            out = []
+            for r in rows:
+                out.append(
+                    {
+                        'Time': str(r.get('Time') or ''),
+                        'Price': float(r.get('Price') or 0) / 1000,
+                        'AvgPrice': float(r.get('AvgPrice') or 0) / 1000,
+                        'Volume': float(r.get('Volume') or 0),
+                    }
+                )
+            if limit > 0 and len(out) > int(limit):
+                out = out[-int(limit):]
+            return out
+        except Exception as e:
+            self.logger.error(f"TDX分时请求失败 code={stock_code} url={url}: {type(e).__name__}: {str(e)}")
+            return []
+
+    def get_trade_data(self, stock_code: str, limit: int = 400) -> List[Dict]:
+        """获取逐笔成交（/api/trade）"""
+        try:
+            url = f"{self.base_url}/api/trade"
+            params = {'code': stock_code}
+            response = requests.get(url, params=params, timeout=self.timeout)
+            result = response.json() if response is not None else {}
+            if result.get('code') != 0:
+                return []
+            rows = (result.get('data') or {}).get('List') or []
+            if not isinstance(rows, list):
+                return []
+            out = []
+            for r in rows:
+                out.append(
+                    {
+                        'Time': str(r.get('Time') or ''),
+                        'Price': float(r.get('Price') or 0) / 1000,
+                        'Volume': float(r.get('Volume') or 0),
+                        'BuyOrSell': str(r.get('BuyOrSell') or ''),
+                    }
+                )
+            if limit > 0 and len(out) > int(limit):
+                out = out[-int(limit):]
+            return out
+        except Exception as e:
+            self.logger.error(f"TDX逐笔请求失败 code={stock_code} url={url}: {type(e).__name__}: {str(e)}")
+            return []
+
     def get_technical_indicators(self, stock_code: str, period: str = 'daily') -> Optional[Dict]:
         """
         计算技术指标
